@@ -493,6 +493,86 @@ app.post('/challenge-invoices', async (req, res) => {
   }
 });
 
+
+// ══════════════════════════════════════════════════════
+//  PROGRAM APPLICATION ALERT
+//
+//  The sign-up form writes the application to the database itself,
+//  then calls this with the row's id. The application is therefore
+//  never lost if the email fails.
+//
+//  The id is looked up before anything is sent, so this endpoint
+//  cannot be used to send mail that isn't backed by a real
+//  application — posting a made-up id gets a 404, not an email.
+// ══════════════════════════════════════════════════════
+app.post('/notify-application', async (req, res) => {
+  const { id } = req.body;
+  if (!id) return res.status(400).json({ error: 'id is required' });
+
+  try {
+    const { data: a, error } = await supabase
+      .from('program_applications')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error || !a) return res.status(404).json({ error: 'Not found' });
+
+    const line = (label, value) =>
+      value ? `<tr><td style="padding:6px 14px 6px 0;color:#888;">${label}</td><td style="padding:6px 0;"><strong>${value}</strong></td></tr>` : '';
+
+    const html = `
+      <div style="font-family:Arial,sans-serif;max-width:560px;">
+        <p style="font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:#C9601F;margin:0 0 6px;">New program application</p>
+        <h2 style="margin:0 0 18px;font-size:22px;">${a.program_name}</h2>
+        <table style="font-size:14px;border-collapse:collapse;">
+          ${line('Type', a.org_type)}
+          ${line('Town', a.town)}
+          ${line('Players', a.players)}
+          ${line('Raising for', a.raising_for)}
+          ${line('Contact', a.contact_name)}
+          ${line('Email', a.contact_email)}
+          ${line('Phone', a.contact_phone)}
+          ${line('Pay to', a.payee_name)}
+          ${line('EIN', a.ein)}
+          ${line('Notes', a.notes)}
+        </table>
+        <p style="font-size:13px;color:#888;margin-top:20px;">
+          They confirmed this is a non-profit program.
+        </p>
+      </div>`;
+
+    const text =
+      `New program application\n\n${a.program_name}\n` +
+      `Type: ${a.org_type}\nTown: ${a.town || '-'}\nPlayers: ${a.players || '-'}\n` +
+      `Raising for: ${a.raising_for || '-'}\n\n` +
+      `Contact: ${a.contact_name}\nEmail: ${a.contact_email}\nPhone: ${a.contact_phone || '-'}\n\n` +
+      `Pay to: ${a.payee_name}\nEIN: ${a.ein || '-'}\nNotes: ${a.notes || '-'}`;
+
+    await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: process.env.MAIL_FROM,
+        to: [process.env.MAIL_REPLY_TO],
+        reply_to: a.contact_email,
+        subject: `New program: ${a.program_name}`,
+        html,
+        text,
+      }),
+    });
+
+    console.log(`Application alert sent for ${a.program_name}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('notify-application error:', e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 app.get('/', (req, res) => res.send('Basketball Money payment server is running.'));
 
 // Sends the card link by email through Resend's HTTP API. No extra
