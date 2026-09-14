@@ -343,6 +343,10 @@ app.post('/create-checkout-session', async (req, res) => {
 //  403, not an invoice run.
 // ══════════════════════════════════════════════════════
 
+// Added to every pledge invoice as its own line. The program keeps
+// the pledge itself in full.
+const PLATFORM_FEE_PCT = 10;
+
 async function requireAdmin(req) {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
@@ -423,9 +427,13 @@ app.post('/challenge-invoices', async (req, res) => {
         continue;
       }
 
-      const amount = +(Number(p.rate_per_point) * points).toFixed(2);
-      const teamAmount = +(amount * (challenge.team_share_pct / 100)).toFixed(2);
-      const platformAmount = +(amount - teamAmount).toFixed(2);
+      // The pledge belongs to the program in full. Our share is added
+      // on top as its own line, so a coach can tell a sponsor
+      // truthfully that every dollar they pledge reaches the team.
+      const pledged = +(Number(p.rate_per_point) * points).toFixed(2);
+      const platformAmount = +(pledged * (PLATFORM_FEE_PCT / 100)).toFixed(2);
+      const amount = +(pledged + platformAmount).toFixed(2);
+      const teamAmount = pledged;
       const cents = Math.round(amount * 100);
 
       if (cents < 50) {
@@ -451,15 +459,24 @@ app.post('/challenge-invoices', async (req, res) => {
         await stripe.invoiceItems.create({
           customer: customer.id,
           currency: 'usd',
-          amount: cents,
+          amount: Math.round(pledged * 100),
           description: `${challenge.name} — pledge of $${Number(p.rate_per_point).toFixed(2)} per point × ${points} points scored by ${who}`,
         });
+
+        if (platformAmount > 0) {
+          await stripe.invoiceItems.create({
+            customer: customer.id,
+            currency: 'usd',
+            amount: Math.round(platformAmount * 100),
+            description: `Platform fee (${PLATFORM_FEE_PCT}%)`,
+          });
+        }
 
         const invoice = await stripe.invoices.create({
           customer: customer.id,
           collection_method: 'send_invoice',
           days_until_due: 30,
-          description: `Thank you for backing ${teamName}. Half of every dollar collected goes straight to the program.`,
+          description: `Thank you for backing ${teamName}. Every dollar you pledged goes to the program.`,
           metadata: { challenge_id, pledge_id: p.id, points: String(points) },
         });
 
