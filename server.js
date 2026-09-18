@@ -28,7 +28,16 @@ const app = express();
 // Where card links point. Set CARD_BASE_URL in Render to your public
 // site (e.g. https://gostardigital.com). No trailing slash.
 const CARD_BASE_URL = (process.env.CARD_BASE_URL || 'https://gostardigital.com').replace(/\/$/, '');
-const MAIL_FROM = process.env.MAIL_FROM || 'Basketball Money <onboarding@resend.dev>';
+// Where a padrino goes to pay. Their email links here rather than
+// straight to Stripe, so one address stays meaningful for the life of
+// the pledge — including after it closes.
+const PAY_BASE = {
+  school: (process.env.PAY_BASE_SCHOOL || 'https://cognitivo.digital').replace(/\/$/, ''),
+  basketball: (process.env.PAY_BASE_BASKETBALL || 'https://hoops.cash').replace(/\/$/, ''),
+};
+const BASKETBALL_GAMES = ['cashrack', 'spots'];
+
+const MAIL_FROM = process.env.MAIL_FROM || 'Cognitivo Digital <onboarding@resend.dev>';
 // Card emails come from a send-only address. Replies need somewhere
 // real to land, so point them at an inbox that is actually read.
 const MAIL_REPLY_TO = process.env.MAIL_REPLY_TO || '';
@@ -51,7 +60,30 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     return res.status(400).send('Invalid signature');
   }
 
-  // A pledge invoice being paid is the other thing worth listening for.
+  // A payment link being paid arrives as a completed checkout session
+  // carrying the pledge id we attached when the link was made.
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const pledgeId = session.metadata && session.metadata.pledge_id;
+
+    if (pledgeId) {
+      try {
+        await supabase
+          .from('pledges')
+          .update({ invoice_status: 'paid', paid_at: new Date().toISOString() })
+          .eq('id', pledgeId);
+        console.log(`Pledge ${pledgeId} paid by link`);
+      } catch (e) {
+        console.error('Could not mark pledge paid:', e);
+        return res.status(500).send('Failed to record payment');
+      }
+      return res.status(200).send('ok');
+    }
+    // No pledge id means this is a card or licence purchase, which the
+    // handler further down deals with.
+  }
+
+  // Kept for any invoice still outstanding from before links.
   if (event.type === 'invoice.paid') {
     const inv = event.data.object;
     try {
@@ -374,6 +406,110 @@ async function requireAdmin(req) {
   return user.email;
 }
 
+
+// ══════════════════════════════════════════════════════
+//  THE PADRINO'S EMAIL
+//
+//  One email per pledge, in the language they pledged in. It states
+//  the score, the arithmetic and the two amounts separately — the
+//  pledge is the program's, the fee is ours — and then one button.
+//
+//  The button goes to our own page rather than to Stripe, so the
+//  address still means something after the pledge is paid or closed.
+// ══════════════════════════════════════════════════════
+async function sendPledgeEmail(o) {
+  const money = (n) => '$' + Number(n).toFixed(2);
+
+  const t = o.lang === 'es' ? {
+    subjectNew: `${o.who} anotó ${o.points} puntos`,
+    subject1: `Recordatorio — la promesa que hiciste por ${o.who}`,
+    subject2: `Última llamada — la promesa por ${o.who}`,
+    hi: `Hola ${o.name},`,
+    scored: `<strong>${o.who}</strong> anotó <strong>${o.points} puntos</strong>.`,
+    pledged: `Prometiste ${money(o.rate)} por punto, así que tu promesa es de <strong>${money(o.pledged)}</strong>.`,
+    feeLine: `Cargo de plataforma (10%)`,
+    totalLine: `Total a pagar`,
+    pay: `Pagar ${money(o.amount)}`,
+    goes: `Los ${money(o.pledged)} de tu promesa van completos a ${o.teamName}.`,
+    window: `El enlace queda abierto treinta días.`,
+    nudge1: `Todavía no hemos recibido tu pago — aquí está el enlace otra vez, por si se te perdió.`,
+    nudge2: `Este es el último recordatorio. Después de treinta días la promesa se cierra y no se debe nada.`,
+    thanks: `Gracias por apoyarlo.`,
+  } : {
+    subjectNew: `${o.who} scored ${o.points} points`,
+    subject1: `A reminder about your pledge for ${o.who}`,
+    subject2: `Last call — your pledge for ${o.who}`,
+    hi: `Hi ${o.name},`,
+    scored: `<strong>${o.who}</strong> scored <strong>${o.points} points</strong>.`,
+    pledged: `You pledged ${money(o.rate)} a point, so your pledge comes to <strong>${money(o.pledged)}</strong>.`,
+    feeLine: `Platform fee (10%)`,
+    totalLine: `Total to pay`,
+    pay: `Pay ${money(o.amount)}`,
+    goes: `The ${money(o.pledged)} you pledged goes to ${o.teamName} in full.`,
+    window: `The link stays open for thirty days.`,
+    nudge1: `We have not seen your payment yet — here is the link again, in case it got buried.`,
+    nudge2: `This is the last reminder. After thirty days the pledge closes and nothing is owed.`,
+    thanks: `Thank you for backing them.`,
+  };
+
+  const subject = o.reminder === 2 ? t.subject2
+                : o.reminder === 1 ? t.subject1
+                : t.subjectNew;
+
+  const nudge = o.reminder === 2 ? t.nudge2
+              : o.reminder === 1 ? t.nudge1
+              : '';
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:520px;color:#111;">
+      <p>${t.hi}</p>
+      ${nudge ? `<p style="color:#555;">${nudge}</p>` : ''}
+      <p style="font-size:17px;">${t.scored}</p>
+      <p>${t.pledged}</p>
+
+      <table style="border-collapse:collapse;font-size:14px;margin:18px 0;">
+        <tr><td style="padding:6px 18px 6px 0;color:#666;">${t.feeLine}</td>
+            <td style="padding:6px 0;">${money(o.platformAmount)}</td></tr>
+        <tr><td style="padding:6px 18px 6px 0;border-top:1px solid #ddd;"><strong>${t.totalLine}</strong></td>
+            <td style="padding:6px 0;border-top:1px solid #ddd;"><strong>${money(o.amount)}</strong></td></tr>
+      </table>
+
+      <p style="margin:22px 0;">
+        <a href="${o.payUrl}"
+           style="display:inline-block;padding:14px 28px;background:#22D3EE;color:#04121A;
+                  text-decoration:none;border-radius:10px;font-weight:bold;font-size:16px;">
+          ${t.pay}
+        </a>
+      </p>
+
+      <p style="color:#555;font-size:14px;">${t.goes}</p>
+      <p style="color:#888;font-size:13px;">${t.window}</p>
+      <p style="color:#555;">${t.thanks}</p>
+    </div>`;
+
+  const text =
+    `${t.hi}\n\n${nudge ? nudge + '\n\n' : ''}` +
+    `${o.who} scored ${o.points} points.\n` +
+    `Your pledge: ${money(o.pledged)}\n` +
+    `Platform fee (10%): ${money(o.platformAmount)}\n` +
+    `Total: ${money(o.amount)}\n\n` +
+    `Pay here: ${o.payUrl}\n`;
+
+  await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: MAIL_FROM,
+      to: [o.to],
+      ...(MAIL_REPLY_TO ? { reply_to: MAIL_REPLY_TO } : {}),
+      subject, html, text,
+    }),
+  });
+}
+
 app.post('/challenge-invoices', async (req, res) => {
   const admin = await requireAdmin(req);
   if (!admin) return res.status(403).json({ error: 'Not authorized' });
@@ -407,12 +543,15 @@ app.post('/challenge-invoices', async (req, res) => {
       .select('*, players(name)')
       .eq('challenge_id', challenge_id);
 
-    const teamName = (challenge.campaigns && challenge.campaigns.name) || 'the team';
+    const teamName = (challenge.campaigns && challenge.campaigns.name) || 'the program';
+    const payBase = BASKETBALL_GAMES.indexOf(challenge.game) !== -1
+      ? PAY_BASE.basketball : PAY_BASE.school;
     const results = { sent: 0, skipped: 0, zero: 0, failed: 0, errors: [] };
 
     for (const p of pledges || []) {
-      // Already invoiced — never bill a sponsor twice.
-      if (p.stripe_invoice_id) { results.skipped++; continue; }
+      // A link already sent is never sent again — a padrino should
+      // hold exactly one.
+      if (p.pay_link_id || p.stripe_invoice_id) { results.skipped++; continue; }
 
       const points = p.player_id ? (pointsByPlayer[p.player_id] || 0) : teamPoints;
 
@@ -448,39 +587,34 @@ app.post('/challenge-invoices', async (req, res) => {
       }
 
       const who = p.player_id && p.players ? p.players.name : teamName;
+      const lang = (p.lang === 'es') ? 'es' : 'en';
 
       try {
-        const customer = await stripe.customers.create({
-          name: p.sponsor_name,
-          email: p.sponsor_email,
-          metadata: { challenge_id, pledge_id: p.id },
-        });
-
-        await stripe.invoiceItems.create({
-          customer: customer.id,
+        // A payment link needs a price object, so one is made for this
+        // exact pledge. Nothing is reused between padrinos — each
+        // amount is its own.
+        const price = await stripe.prices.create({
           currency: 'usd',
-          amount: Math.round(pledged * 100),
-          description: `${challenge.name} — pledge of $${Number(p.rate_per_point).toFixed(2)} per point × ${points} points scored by ${who}`,
+          unit_amount: cents,
+          product_data: {
+            name: lang === 'es'
+              ? `${challenge.name} — ${points} puntos de ${who}`
+              : `${challenge.name} — ${points} points scored by ${who}`,
+          },
         });
 
-        if (platformAmount > 0) {
-          await stripe.invoiceItems.create({
-            customer: customer.id,
-            currency: 'usd',
-            amount: Math.round(platformAmount * 100),
-            description: `Platform fee (${PLATFORM_FEE_PCT}%)`,
-          });
-        }
-
-        const invoice = await stripe.invoices.create({
-          customer: customer.id,
-          collection_method: 'send_invoice',
-          days_until_due: 30,
-          description: `Thank you for backing ${teamName}. Every dollar you pledged goes to the program.`,
+        const link = await stripe.paymentLinks.create({
+          line_items: [{ price: price.id, quantity: 1 }],
           metadata: { challenge_id, pledge_id: p.id, points: String(points) },
+          // One payment and the link is spent — a second tap on the
+          // same link would otherwise charge somebody's grandmother
+          // twice.
+          restrictions: { completed_sessions: { limit: 1 } },
+          after_completion: {
+            type: 'redirect',
+            redirect: { url: `${payBase}/pay.html?p=${p.id}&paid=1` },
+          },
         });
-
-        await stripe.invoices.sendInvoice(invoice.id);
 
         await supabase.from('pledges')
           .update({
@@ -488,21 +622,32 @@ app.post('/challenge-invoices', async (req, res) => {
             amount,
             team_amount: teamAmount,
             platform_amount: platformAmount,
-            stripe_invoice_id: invoice.id,
+            pay_link_id: link.id,
+            pay_link_url: link.url,
             invoice_status: 'sent',
             invoiced_at: new Date().toISOString(),
           })
           .eq('id', p.id);
 
+        await sendPledgeEmail({
+          to: p.sponsor_email,
+          name: p.sponsor_name,
+          who, points, teamName, lang,
+          rate: Number(p.rate_per_point),
+          pledged, platformAmount, amount,
+          payUrl: `${payBase}/pay.html?p=${p.id}`,
+          reminder: 0,
+        });
+
         results.sent++;
       } catch (e) {
-        console.error(`Invoice failed for pledge ${p.id}:`, e.message);
+        console.error(`Payment link failed for pledge ${p.id}:`, e.message);
         results.failed++;
         results.errors.push(`${p.sponsor_name}: ${e.message}`);
       }
     }
 
-    console.log(`Challenge ${challenge_id} invoicing —`, JSON.stringify(results));
+    console.log(`Challenge ${challenge_id} payment links —`, JSON.stringify(results));
     res.json(results);
   } catch (e) {
     console.error('challenge-invoices error:', e);
@@ -586,6 +731,100 @@ app.post('/notify-application', async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     console.error('notify-application error:', e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+
+// ══════════════════════════════════════════════════════
+//  REMINDERS
+//
+//  Invoicing chased people for us. A link does not, so this does —
+//  once at seven days, once at twenty-one, and then never again.
+//  At thirty days the pledge closes and nothing more is asked.
+//
+//  Admin presses a button. Automatic scheduling is a later problem;
+//  pressing this twice a month is not a burden.
+// ══════════════════════════════════════════════════════
+app.post('/send-reminders', async (req, res) => {
+  const admin = await requireAdmin(req);
+  if (!admin.ok) return res.status(admin.code).json({ error: admin.error });
+
+  const { challenge_id } = req.body;
+  if (!challenge_id) return res.status(400).json({ error: 'challenge_id is required' });
+
+  try {
+    const { data: challenge } = await supabase
+      .from('challenges')
+      .select('name, campaign_id, campaigns(name)')
+      .eq('id', challenge_id)
+      .single();
+
+    if (!challenge) return res.status(404).json({ error: 'Challenge not found' });
+
+    const { data: pledges } = await supabase
+      .from('pledges')
+      .select('*, players(name)')
+      .eq('challenge_id', challenge_id)
+      .eq('invoice_status', 'sent');
+
+    const teamName = (challenge.campaigns && challenge.campaigns.name) || 'the program';
+    const now = Date.now();
+    const days = (iso) => (now - new Date(iso).getTime()) / 86400000;
+
+    const results = { sent: 0, notDue: 0, done: 0, failed: 0, errors: [] };
+
+    for (const p of pledges || []) {
+      if (!p.invoiced_at || !p.pay_link_url) { results.notDue++; continue; }
+
+      const age = days(p.invoiced_at);
+      const count = p.reminder_count || 0;
+
+      // Two reminders, and only when they are actually due.
+      let which = 0;
+      if (count === 0 && age >= 7 && age < 30) which = 1;
+      else if (count === 1 && age >= 21 && age < 30) which = 2;
+
+      if (!which) {
+        if (count >= 2 || age >= 30) results.done++;
+        else results.notDue++;
+        continue;
+      }
+
+      try {
+        await sendPledgeEmail({
+          to: p.sponsor_email,
+          name: p.sponsor_name,
+          who: p.player_id && p.players ? p.players.name : teamName,
+          points: p.points_at_invoice || 0,
+          teamName,
+          lang: p.lang === 'es' ? 'es' : 'en',
+          rate: Number(p.rate_per_point),
+          pledged: Number(p.team_amount),
+          platformAmount: Number(p.platform_amount),
+          amount: Number(p.amount),
+          payUrl: p.pay_link_url.includes('pay.html')
+            ? p.pay_link_url
+            : `${PAY_BASE.school}/pay.html?p=${p.id}`,
+          reminder: which,
+        });
+
+        await supabase.from('pledges')
+          .update({ reminder_count: which, reminded_at: new Date().toISOString() })
+          .eq('id', p.id);
+
+        results.sent++;
+      } catch (e) {
+        console.error(`Reminder failed for pledge ${p.id}:`, e.message);
+        results.failed++;
+        results.errors.push(`${p.sponsor_name}: ${e.message}`);
+      }
+    }
+
+    console.log(`Challenge ${challenge_id} reminders —`, JSON.stringify(results));
+    res.json(results);
+  } catch (e) {
+    console.error('send-reminders error:', e);
     res.status(500).json({ error: String(e) });
   }
 });
