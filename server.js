@@ -26,8 +26,8 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const app = express();
 
 // Where card links point. Set CARD_BASE_URL in Render to your public
-// site (e.g. https://cashflowhoops.com). No trailing slash.
-const CARD_BASE_URL = (process.env.CARD_BASE_URL || 'https://cashflowhoops.com').replace(/\/$/, '');
+// site (e.g. https://gostardigital.com). No trailing slash.
+const CARD_BASE_URL = (process.env.CARD_BASE_URL || 'https://gostardigital.com').replace(/\/$/, '');
 const MAIL_FROM = process.env.MAIL_FROM || 'Basketball Money <onboarding@resend.dev>';
 // Card emails come from a send-only address. Replies need somewhere
 // real to land, so point them at an inbox that is actually read.
