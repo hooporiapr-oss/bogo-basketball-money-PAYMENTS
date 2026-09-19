@@ -495,7 +495,14 @@ async function sendPledgeEmail(o) {
     `Total: ${money(o.amount)}\n\n` +
     `Pay here: ${o.payUrl}\n`;
 
-  await fetch('https://api.resend.com/emails', {
+  // A send that does not happen must not be reported as one. Without
+  // this the endpoint counts a link as sent while the padrino never
+  // hears from us.
+  if (!process.env.RESEND_API_KEY) {
+    throw new Error('RESEND_API_KEY is not set on this server');
+  }
+
+  const r = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
@@ -508,6 +515,11 @@ async function sendPledgeEmail(o) {
       subject, html, text,
     }),
   });
+
+  if (!r.ok) {
+    const detail = await r.text().catch(() => '');
+    throw new Error(`Resend refused the email (${r.status}): ${detail.slice(0, 300)}`);
+  }
 }
 
 app.post('/challenge-invoices', async (req, res) => {
