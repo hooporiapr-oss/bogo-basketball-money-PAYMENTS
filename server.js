@@ -77,6 +77,17 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         console.error('Could not mark pledge paid:', e);
         return res.status(500).send('Failed to record payment');
       }
+
+      // The thank-you. Sent after the pledge is recorded, and never
+      // allowed to fail the webhook — a padrino who does not get a
+      // thank-you is a small thing; Stripe retrying a payment we have
+      // already recorded is not.
+      try {
+        await sendThankYou(pledgeId);
+      } catch (e) {
+        console.error(`Thank-you email failed for pledge ${pledgeId}:`, e.message);
+      }
+
       return res.status(200).send('ok');
     }
     // No pledge id means this is a card or licence purchase, which the
@@ -417,6 +428,83 @@ async function requireAdmin(req) {
 //  The button goes to our own page rather than to Stripe, so the
 //  address still means something after the pledge is paid or closed.
 // ══════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════
+//  THE THANK-YOU
+//
+//  Sent when a pledge is paid. It names the participant and the score
+//  one last time, because that is what the padrino actually backed —
+//  and it says plainly where the money went, which a bank statement
+//  reading "Gostar Digital" does not.
+// ══════════════════════════════════════════════════════
+async function sendThankYou(pledgeId) {
+  const { data: p } = await supabase
+    .from('pledges')
+    .select('*, players(name), challenges(name, campaigns(name))')
+    .eq('id', pledgeId)
+    .single();
+
+  if (!p || !p.sponsor_email) return;
+
+  const money = (n) => '$' + Number(n || 0).toFixed(2);
+  const who = (p.players && p.players.name)
+    || (p.challenges && p.challenges.campaigns && p.challenges.campaigns.name)
+    || 'your program';
+  const program = (p.challenges && p.challenges.campaigns && p.challenges.campaigns.name) || 'the program';
+  const points = p.points_at_invoice || 0;
+  const lang = p.lang === 'es' ? 'es' : 'en';
+
+  const t = lang === 'es' ? {
+    subject: `Gracias por apoyar a ${who}`,
+    hi: `Hola ${p.sponsor_name},`,
+    big: `Gracias por apoyar a <strong>${who}</strong>.`,
+    body: `Anotó <strong>${points} puntos</strong>, y tu promesa de <strong>${money(p.team_amount)}</strong> va camino a ${program}.`,
+    nothing: `No se debe nada más.`,
+    sign: `— Gostar Digital`,
+  } : {
+    subject: `Thank you for backing ${who}`,
+    hi: `Hi ${p.sponsor_name},`,
+    big: `Thank you for backing <strong>${who}</strong>.`,
+    body: `They scored <strong>${points} points</strong>, and your pledge of <strong>${money(p.team_amount)}</strong> is on its way to ${program}.`,
+    nothing: `Nothing further is owed.`,
+    sign: `— Gostar Digital`,
+  };
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:520px;color:#111;">
+      <p>${t.hi}</p>
+      <p style="font-size:18px;">${t.big}</p>
+      <p>${t.body}</p>
+      <p style="color:#666;font-size:14px;">${t.nothing}</p>
+      <p style="color:#666;font-size:14px;">${t.sign}</p>
+    </div>`;
+
+  const text = `${t.hi}\n\n${t.big.replace(/<[^>]+>/g, '')}\n` +
+               `${t.body.replace(/<[^>]+>/g, '')}\n\n${t.nothing}\n${t.sign}\n`;
+
+  if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
+
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: MAIL_FROM,
+      to: [p.sponsor_email],
+      ...(MAIL_REPLY_TO ? { reply_to: MAIL_REPLY_TO } : {}),
+      subject: t.subject, html, text,
+    }),
+  });
+
+  if (!r.ok) {
+    const detail = await r.text().catch(() => '');
+    throw new Error(`Resend refused the thank-you (${r.status}): ${detail.slice(0, 300)}`);
+  }
+}
+
+
 async function sendPledgeEmail(o) {
   const money = (n) => '$' + Number(n).toFixed(2);
 
