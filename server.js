@@ -32,7 +32,7 @@ const CARD_BASE_URL = (process.env.CARD_BASE_URL || 'https://gostardigital.com')
 // straight to Stripe, so one address stays meaningful for the life of
 // the pledge — including after it closes.
 const PAY_BASE = {
-  school: (process.env.PAY_BASE_SCHOOL || 'https://cognitivo.digital').replace(/\/$/, ''),
+  school: (process.env.PAY_BASE_SCHOOL || 'https://apoyazo.com').replace(/\/$/, ''),
   basketball: (process.env.PAY_BASE_BASKETBALL || 'https://hoops.cash').replace(/\/$/, ''),
 };
 const BASKETBALL_GAMES = ['cashrack', 'spots'];
