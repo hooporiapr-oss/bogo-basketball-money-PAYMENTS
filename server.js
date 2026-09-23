@@ -32,12 +32,12 @@ const CARD_BASE_URL = (process.env.CARD_BASE_URL || 'https://gostardigital.com')
 // straight to Stripe, so one address stays meaningful for the life of
 // the pledge — including after it closes.
 const PAY_BASE = {
-  school: (process.env.PAY_BASE_SCHOOL || 'https://apoyazo.com').replace(/\/$/, ''),
+  school: (process.env.PAY_BASE_SCHOOL || 'https://cadapunto.com').replace(/\/$/, ''),
   basketball: (process.env.PAY_BASE_BASKETBALL || 'https://hoops.cash').replace(/\/$/, ''),
 };
 const BASKETBALL_GAMES = ['cashrack', 'spots'];
 
-const MAIL_FROM = process.env.MAIL_FROM || 'Apoyazo <onboarding@resend.dev>';
+const MAIL_FROM = process.env.MAIL_FROM || 'Cada Punto <onboarding@resend.dev>';
 // Card emails come from a send-only address. Replies need somewhere
 // real to land, so point them at an inbox that is actually read.
 const MAIL_REPLY_TO = process.env.MAIL_REPLY_TO || '';
@@ -460,14 +460,14 @@ async function sendThankYou(pledgeId) {
     big: `Gracias por apoyar a <strong>${who}</strong>.`,
     body: `Anotó <strong>${points} puntos</strong>, y tu promesa de <strong>${money(p.team_amount)}</strong> va camino a ${program}.`,
     nothing: `No se debe nada más.`,
-    sign: `— Apoyazo`,
+    sign: `— Cada Punto`,
   } : {
     subject: `Thank you for backing ${who}`,
     hi: `Hi ${p.sponsor_name},`,
     big: `Thank you for backing <strong>${who}</strong>.`,
     body: `They scored <strong>${points} points</strong>, and your pledge of <strong>${money(p.team_amount)}</strong> is on its way to ${program}.`,
     nothing: `Nothing further is owed.`,
-    sign: `— Apoyazo`,
+    sign: `— Cada Punto`,
   };
 
   const html = `
