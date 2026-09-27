@@ -68,9 +68,24 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
     if (pledgeId) {
       try {
+        // What they actually paid, which may not be what was billed:
+        // the pay page lets a padrino round up or pay less. The
+        // program's share and our fee follow the real figure, keeping
+        // the fee on top rather than out of the pledge.
+        const paidCents = (session && (session.amount_total ?? session.amount_subtotal)) || 0;
+        const patch = { invoice_status: 'paid', paid_at: new Date().toISOString() };
+
+        if (paidCents > 0) {
+          const paid = paidCents / 100;
+          const team = Math.round((paid / 1.10) * 100) / 100;
+          patch.amount = paid;
+          patch.team_amount = team;
+          patch.platform_amount = Math.round((paid - team) * 100) / 100;
+        }
+
         await supabase
           .from('pledges')
-          .update({ invoice_status: 'paid', paid_at: new Date().toISOString() })
+          .update(patch)
           .eq('id', pledgeId);
         console.log(`Pledge ${pledgeId} paid by link`);
       } catch (e) {
@@ -609,6 +624,73 @@ async function sendPledgeEmail(o) {
     throw new Error(`Resend refused the email (${r.status}): ${detail.slice(0, 300)}`);
   }
 }
+
+
+// ══════════════════════════════════════════════════════
+//  PAY WHAT YOU DECIDE
+//
+//  A padrino pledged per point, but the person in front of the bill
+//  may want to round up, or may be having a hard month. This makes a
+//  checkout for whatever they choose rather than only the exact
+//  figure — the pledge is a promise, not a debt collector.
+// ══════════════════════════════════════════════════════
+app.post('/pay-pledge', async (req, res) => {
+  try {
+    const { pledge_id, amount } = req.body;
+    if (!pledge_id) return res.status(400).json({ error: 'pledge_id is required' });
+
+    const cents = Math.round(Number(amount) * 100);
+    if (!Number.isFinite(cents) || cents < 100) {
+      return res.status(400).json({ error: 'Amount must be at least $1.00' });
+    }
+    if (cents > 500000) {
+      return res.status(400).json({ error: 'Amount is too large' });
+    }
+
+    const { data: p } = await supabase
+      .from('pledges')
+      .select('*, players(name), challenges(name, campaigns(name))')
+      .eq('id', pledge_id)
+      .single();
+
+    if (!p) return res.status(404).json({ error: 'Pledge not found' });
+    if (p.invoice_status === 'paid') {
+      return res.status(400).json({ error: 'This pledge has already been paid' });
+    }
+
+    const who = (p.players && p.players.name) || 'the program';
+    const program = (p.challenges && p.challenges.campaigns && p.challenges.campaigns.name) || 'the program';
+    const base = PAY_BASE.school;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: `Backing ${who}`,
+            description: `${program} · ${p.points_at_invoice || 0} points`,
+          },
+          unit_amount: cents,
+        },
+        quantity: 1,
+      }],
+      metadata: {
+        pledge_id: String(pledge_id),
+        chosen_amount: String(cents),
+      },
+      ...(p.sponsor_email ? { customer_email: p.sponsor_email } : {}),
+      success_url: `${base}/pay.html?p=${encodeURIComponent(pledge_id)}&paid=1`,
+      cancel_url: `${base}/pay.html?p=${encodeURIComponent(pledge_id)}`,
+    });
+
+    return res.json({ url: session.url });
+  } catch (e) {
+    console.error('Pay pledge:', e);
+    return res.status(500).json({ error: e.message });
+  }
+});
 
 app.post('/challenge-invoices', async (req, res) => {
   const admin = await requireAdmin(req);
