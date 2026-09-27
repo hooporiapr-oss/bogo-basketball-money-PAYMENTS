@@ -634,7 +634,9 @@ app.post('/challenge-invoices', async (req, res) => {
     const pointsByPlayer = {};
     let teamPoints = 0;
     (runs || []).forEach(r => {
-      pointsByPlayer[r.player_id] = r.points || 0;
+      // three runs per student now, so they add up rather than the
+      // last one winning
+      pointsByPlayer[r.player_id] = (pointsByPlayer[r.player_id] || 0) + (r.points || 0);
       teamPoints += r.points || 0;
     });
 
