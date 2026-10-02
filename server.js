@@ -73,11 +73,13 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       try {
         // Nada que hacer si ya estaba pagada: Stripe reintenta, y el
         // padrino no debe recibir dos gracias.
-        const { data: existing } = await supabase
+        const { data: existing, error: exErr } = await supabase
           .from('game_pledges')
-          .select('*, games(opponent, home, team_points), campaigns(name)')
+          .select('*')
           .eq('id', gamePledgeId)
           .single();
+
+        if (exErr) console.error('Game pledge lookup:', exErr.message);
 
         if (existing && existing.invoice_status === 'paid') {
           return res.json({ received: true });
@@ -90,20 +92,29 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 
         if (existing) {
           try {
+            const { data: gm } = await supabase
+              .from('games').select('opponent, home')
+              .eq('id', existing.game_id).single();
+            const { data: cp } = await supabase
+              .from('campaigns').select('name')
+              .eq('id', existing.campaign_id).single();
+
             await sendGameThanks({
               to: existing.padrino_email,
               name: existing.padrino_name,
-              teamName: (existing.campaigns && existing.campaigns.name) || 'the program',
-              label: existing.games
-                ? `${existing.games.home ? 'vs' : '@'} ${existing.games.opponent}` : '',
+              teamName: (cp && cp.name) || 'the program',
+              label: gm ? `${gm.home ? 'vs' : '@'} ${gm.opponent}` : '',
               points: existing.points || 0,
               pledged: Number(existing.team_amount || 0),
               amount: Number(existing.amount || 0),
             });
+            console.log(`Thanks sent to ${existing.padrino_email}`);
           } catch (e) {
             // Un gracias que no sale no debe romper el cobro.
             console.error('Game thanks:', e.message);
           }
+        } else {
+          console.error(`Game pledge ${gamePledgeId}: no row, no thanks sent`);
         }
       } catch (e) {
         console.error('Game pledge webhook:', e.message);
