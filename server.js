@@ -64,6 +64,23 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   // carrying the pledge id we attached when the link was made.
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
+
+    // Una promesa por juego se marca pagada aquí. El reparto ya se
+    // calculó cuando se cerró el juego, así que sólo hace falta
+    // anotar que entró.
+    const gamePledgeId = session.metadata && session.metadata.game_pledge_id;
+    if (gamePledgeId) {
+      try {
+        await supabase.from('game_pledges')
+          .update({ invoice_status: 'paid', paid_at: new Date().toISOString() })
+          .eq('id', gamePledgeId);
+        console.log(`Game pledge ${gamePledgeId} paid`);
+      } catch (e) {
+        console.error('Game pledge webhook:', e.message);
+      }
+      return res.json({ received: true });
+    }
+
     const pledgeId = session.metadata && session.metadata.pledge_id;
 
     if (pledgeId) {
@@ -691,6 +708,200 @@ app.post('/pay-pledge', async (req, res) => {
     return res.status(500).json({ error: e.message });
   }
 });
+
+
+// ══════════════════════════════════════════════════════════════
+//  Promesas por juego
+//
+//  Un juego se cierra con su marcador y entonces cada promesa
+//  abierta se puede cobrar. Esto manda un enlace de pago por
+//  correo, uno por promesa, igual que con los retos.
+// ══════════════════════════════════════════════════════════════
+app.post('/game-invoices', async (req, res) => {
+  const admin = await requireAdmin(req);
+  if (!admin) return res.status(403).json({ error: 'Not authorized' });
+
+  const { game_id } = req.body;
+  if (!game_id) return res.status(400).json({ error: 'game_id is required' });
+
+  try {
+    const { data: game, error: gErr } = await supabase
+      .from('games')
+      .select('id, opponent, plays_on, home, team_points, status, campaign_id, campaigns(name)')
+      .eq('id', game_id)
+      .single();
+
+    if (gErr || !game) return res.status(404).json({ error: 'Game not found' });
+    if (game.status !== 'played') {
+      return res.status(400).json({ error: 'Enter the score first' });
+    }
+
+    const points = Number(game.team_points || 0);
+    const teamName = (game.campaigns && game.campaigns.name) || 'the program';
+    const label = `${game.home ? 'vs' : '@'} ${game.opponent}`;
+
+    const { data: pledges } = await supabase
+      .from('game_pledges')
+      .select('*')
+      .eq('game_id', game_id);
+
+    const results = { sent: 0, skipped: 0, zero: 0, failed: 0, errors: [] };
+
+    for (const p of pledges || []) {
+      if (p.invoice_status !== 'open') { results.skipped++; continue; }
+
+      // Sin puntos no hay nada que cobrar. Se cierra la promesa en vez
+      // de dejarla pendiente para siempre.
+      if (points <= 0) {
+        await supabase.from('game_pledges')
+          .update({ points: 0, amount: 0, team_amount: 0,
+                    platform_amount: 0, invoice_status: 'void' })
+          .eq('id', p.id);
+        results.zero++;
+        continue;
+      }
+
+      // El tope lo pone el padrino: nunca paga más de lo que dijo.
+      const raw = Number(p.rate) * points;
+      const pledged = +(p.cap != null ? Math.min(raw, Number(p.cap)) : raw).toFixed(2);
+      const platformAmount = +(pledged * (PLATFORM_FEE_PCT / 100)).toFixed(2);
+      const amount = +(pledged + platformAmount).toFixed(2);
+      const cents = Math.round(amount * 100);
+
+      if (cents < 50) {
+        await supabase.from('game_pledges')
+          .update({ points, amount, team_amount: pledged,
+                    platform_amount: platformAmount, invoice_status: 'void' })
+          .eq('id', p.id);
+        results.zero++;
+        continue;
+      }
+
+      try {
+        const price = await stripe.prices.create({
+          currency: 'usd',
+          unit_amount: cents,
+          product_data: { name: `${teamName} ${label} — ${points} points` },
+        });
+
+        const link = await stripe.paymentLinks.create({
+          line_items: [{ price: price.id, quantity: 1 }],
+          metadata: { game_pledge_id: p.id, game_id, points: String(points) },
+          restrictions: { completed_sessions: { limit: 1 } },
+          after_completion: {
+            type: 'redirect',
+            redirect: { url: `${PAY_BASE.school}/pay.html?g=${p.id}&paid=1` },
+          },
+        });
+
+        await supabase.from('game_pledges')
+          .update({
+            points,
+            amount,
+            team_amount: pledged,
+            platform_amount: platformAmount,
+            stripe_session: link.url,
+            invoice_status: 'sent',
+          })
+          .eq('id', p.id);
+
+        await sendGameEmail({
+          to: p.padrino_email,
+          name: p.padrino_name,
+          teamName, label, points,
+          rate: Number(p.rate),
+          pledged, platformAmount, amount,
+          payUrl: link.url,
+        });
+
+        results.sent++;
+      } catch (e) {
+        console.error(`Game pledge ${p.id}:`, e.message);
+        results.failed++;
+        results.errors.push(`${p.padrino_name}: ${e.message}`);
+      }
+    }
+
+    return res.json(results);
+  } catch (e) {
+    console.error('Game invoices:', e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// El correo que recibe el padrino después del juego.
+async function sendGameEmail(o) {
+  const money = (n) => '$' + Number(n).toFixed(2);
+
+  const subject = `${o.teamName} ${o.label} — ${o.points} points`;
+
+  const html = `
+    <div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#12202E">
+      <p style="font-size:.75rem;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:#5A6B7C;margin:0 0 6px">
+        Cada Punto Cuenta
+      </p>
+      <h1 style="font-size:1.5rem;margin:0 0 4px">${o.teamName} ${o.label}</h1>
+      <p style="margin:0 0 18px;color:#5A6B7C">Final: <b style="color:#12202E">${o.points} points</b></p>
+
+      <p>Hi ${o.name},</p>
+      <p>You pledged ${money(o.rate)} a point. Here is what that comes to:</p>
+
+      <table style="width:100%;border-collapse:collapse;margin:14px 0">
+        <tr><td style="padding:7px 0;border-bottom:1px solid #D7E0E8">Your pledge</td>
+            <td style="padding:7px 0;border-bottom:1px solid #D7E0E8;text-align:right">${money(o.pledged)}</td></tr>
+        <tr><td style="padding:7px 0;border-bottom:1px solid #D7E0E8;color:#5A6B7C">Platform fee (10%)</td>
+            <td style="padding:7px 0;border-bottom:1px solid #D7E0E8;text-align:right;color:#5A6B7C">${money(o.platformAmount)}</td></tr>
+        <tr><td style="padding:9px 0;font-weight:800">Total</td>
+            <td style="padding:9px 0;text-align:right;font-weight:800">${money(o.amount)}</td></tr>
+      </table>
+
+      <p style="margin:0 0 6px;color:#5A6B7C;font-size:.9rem">
+        The program receives your full ${money(o.pledged)} — our fee is added on top, never taken out of it.
+      </p>
+
+      <a href="${o.payUrl}"
+         style="display:block;text-align:center;background:#12202E;color:#fff;text-decoration:none;
+                padding:15px;border-radius:4px;font-weight:800;margin:18px 0">
+        Pay ${money(o.amount)}
+      </a>
+
+      <p style="color:#5A6B7C;font-size:.82rem;margin-top:20px">
+        Gostar Digital LLC · Puerto Rico
+      </p>
+    </div>`;
+
+  const text =
+    `${o.teamName} ${o.label} — ${o.points} points\n\n` +
+    `Hi ${o.name},\n\n` +
+    `You pledged ${money(o.rate)} a point.\n` +
+    `Your pledge: ${money(o.pledged)}\n` +
+    `Platform fee (10%): ${money(o.platformAmount)}\n` +
+    `Total: ${money(o.amount)}\n\n` +
+    `Pay here: ${o.payUrl}\n\n` +
+    `The program receives your full ${money(o.pledged)}.\n` +
+    `Gostar Digital LLC · Puerto Rico\n`;
+
+  if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
+
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: MAIL_FROM,
+      to: [o.to],
+      ...(MAIL_REPLY_TO ? { reply_to: MAIL_REPLY_TO } : {}),
+      subject, html, text,
+    }),
+  });
+
+  if (!r.ok) {
+    const detail = await r.text().catch(() => '');
+    throw new Error(`Resend refused the invoice (${r.status}): ${detail.slice(0, 300)}`);
+  }
+}
 
 app.post('/challenge-invoices', async (req, res) => {
   const admin = await requireAdmin(req);
