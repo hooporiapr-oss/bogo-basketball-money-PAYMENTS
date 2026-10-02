@@ -71,10 +71,40 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     const gamePledgeId = session.metadata && session.metadata.game_pledge_id;
     if (gamePledgeId) {
       try {
+        // Nada que hacer si ya estaba pagada: Stripe reintenta, y el
+        // padrino no debe recibir dos gracias.
+        const { data: existing } = await supabase
+          .from('game_pledges')
+          .select('*, games(opponent, home, team_points), campaigns(name)')
+          .eq('id', gamePledgeId)
+          .single();
+
+        if (existing && existing.invoice_status === 'paid') {
+          return res.json({ received: true });
+        }
+
         await supabase.from('game_pledges')
           .update({ invoice_status: 'paid', paid_at: new Date().toISOString() })
           .eq('id', gamePledgeId);
         console.log(`Game pledge ${gamePledgeId} paid`);
+
+        if (existing) {
+          try {
+            await sendGameThanks({
+              to: existing.padrino_email,
+              name: existing.padrino_name,
+              teamName: (existing.campaigns && existing.campaigns.name) || 'the program',
+              label: existing.games
+                ? `${existing.games.home ? 'vs' : '@'} ${existing.games.opponent}` : '',
+              points: existing.points || 0,
+              pledged: Number(existing.team_amount || 0),
+              amount: Number(existing.amount || 0),
+            });
+          } catch (e) {
+            // Un gracias que no sale no debe romper el cobro.
+            console.error('Game thanks:', e.message);
+          }
+        }
       } catch (e) {
         console.error('Game pledge webhook:', e.message);
       }
@@ -717,6 +747,69 @@ app.post('/pay-pledge', async (req, res) => {
 //  abierta se puede cobrar. Esto manda un enlace de pago por
 //  correo, uno por promesa, igual que con los retos.
 // ══════════════════════════════════════════════════════════════
+
+// El gracias después de pagar. Corto, y dice a dónde fue el dinero.
+async function sendGameThanks(o) {
+  const money = (n) => '$' + Number(n).toFixed(2);
+
+  const subject = `Thank you — ${o.teamName}`;
+
+  const html = `
+    <div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#12202E">
+      <p style="font-size:.75rem;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:#5A6B7C;margin:0 0 6px">
+        Cada Punto Cuenta
+      </p>
+      <h1 style="font-size:1.6rem;margin:0 0 14px">Thank you, ${o.name}.</h1>
+
+      <p style="margin:0 0 4px">${o.teamName} ${o.label}</p>
+      <p style="margin:0 0 18px;color:#5A6B7C"><b style="color:#12202E;font-size:1.2rem">${o.points}</b> points scored</p>
+
+      <div style="border:2px solid #12202E;border-radius:4px;padding:16px;text-align:center;margin:0 0 18px">
+        <div style="font-size:2rem;font-weight:900;line-height:1">${money(o.pledged)}</div>
+        <div style="font-size:.64rem;font-weight:900;letter-spacing:.2em;text-transform:uppercase;color:#5A6B7C;margin-top:4px">
+          goes to the program
+        </div>
+      </div>
+
+      <p style="color:#5A6B7C;font-size:.92rem">
+        You paid ${money(o.amount)}. Every dollar of your pledge reaches ${o.teamName} —
+        our platform fee was added on top, never taken out of it.
+      </p>
+
+      <p style="color:#5A6B7C;font-size:.82rem;margin-top:22px">
+        Gostar Digital LLC · Puerto Rico
+      </p>
+    </div>`;
+
+  const text =
+    `Thank you, ${o.name}.\n\n` +
+    `${o.teamName} ${o.label} — ${o.points} points\n\n` +
+    `${money(o.pledged)} goes to the program.\n` +
+    `You paid ${money(o.amount)}; our fee was added on top.\n\n` +
+    `Gostar Digital LLC · Puerto Rico\n`;
+
+  if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
+
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: MAIL_FROM,
+      to: [o.to],
+      ...(MAIL_REPLY_TO ? { reply_to: MAIL_REPLY_TO } : {}),
+      subject, html, text,
+    }),
+  });
+
+  if (!r.ok) {
+    const detail = await r.text().catch(() => '');
+    throw new Error(`Resend refused the thanks (${r.status}): ${detail.slice(0, 300)}`);
+  }
+}
+
 app.post('/game-invoices', async (req, res) => {
   const admin = await requireAdmin(req);
   if (!admin) return res.status(403).json({ error: 'Not authorized' });
