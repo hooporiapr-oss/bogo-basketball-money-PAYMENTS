@@ -794,6 +794,8 @@ app.post('/game-invoices', async (req, res) => {
           },
         });
 
+        // El enlace se guarda enseguida: ya existe en Stripe y se
+        // perdería si el correo falla.
         await supabase.from('game_pledges')
           .update({
             points,
@@ -801,7 +803,6 @@ app.post('/game-invoices', async (req, res) => {
             team_amount: pledged,
             platform_amount: platformAmount,
             stripe_session: link.url,
-            invoice_status: 'sent',
           })
           .eq('id', p.id);
 
@@ -813,6 +814,11 @@ app.post('/game-invoices', async (req, res) => {
           pledged, platformAmount, amount,
           payUrl: link.url,
         });
+
+        // Sólo cuando el correo salió de verdad.
+        await supabase.from('game_pledges')
+          .update({ invoice_status: 'sent' })
+          .eq('id', p.id);
 
         results.sent++;
       } catch (e) {
