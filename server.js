@@ -821,6 +821,88 @@ async function sendGameThanks(o) {
   }
 }
 
+
+// ══════════════════════════════════════════════════════════════
+//  Aviso de un equipo que se inscribe
+//
+//  La petición ya quedó guardada antes de llegar aquí; esto sólo
+//  avisa, para no tener que estar mirando el admin. Si el correo
+//  falla, la petición sigue ahí.
+// ══════════════════════════════════════════════════════════════
+app.post('/team-signup', async (req, res) => {
+  const { team, program, coach, email, phone } = req.body || {};
+
+  if (!team || !email) {
+    return res.status(400).json({ error: 'team and email are required' });
+  }
+
+  const to = process.env.ADMIN_EMAIL || 'gostardigital@gmail.com';
+
+  const row = (k, v) =>
+    `<tr><td style="padding:6px 14px 6px 0;color:#5A6B7C">${k}</td>` +
+    `<td style="padding:6px 0;font-weight:700">${v || '—'}</td></tr>`;
+
+  const html = `
+    <div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#12202E">
+      <p style="font-size:.72rem;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:#0C6E8C;margin:0 0 6px">
+        Cada Punto
+      </p>
+      <h1 style="font-size:1.4rem;margin:0 0 14px">${team} quiere una campaña</h1>
+      <table style="width:100%;border-collapse:collapse;font-size:.95rem">
+        ${row('Equipo', team)}
+        ${row('Programa', program)}
+        ${row('Coach', coach)}
+        ${row('Correo', `<a href="mailto:${email}">${email}</a>`)}
+        ${row('Teléfono', phone)}
+      </table>
+      <p style="margin:18px 0 0;color:#5A6B7C;font-size:.9rem">
+        Aprueba o rechaza desde el admin — la petición ya está en la cola.
+      </p>
+      <p style="color:#5A6B7C;font-size:.8rem;margin-top:20px">
+        Gostar Digital LLC · Puerto Rico
+      </p>
+    </div>`;
+
+  const text =
+    `${team} quiere una campaña\n\n` +
+    `Equipo:   ${team}\n` +
+    `Programa: ${program || '—'}\n` +
+    `Coach:    ${coach || '—'}\n` +
+    `Correo:   ${email}\n` +
+    `Teléfono: ${phone || '—'}\n\n` +
+    `Aprueba desde el admin.\n`;
+
+  try {
+    if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
+
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: MAIL_FROM,
+        to: [to],
+        reply_to: email,          // contestar le escribe al coach
+        subject: `Nuevo equipo: ${team}`,
+        html, text,
+      }),
+    });
+
+    if (!r.ok) {
+      const detail = await r.text().catch(() => '');
+      throw new Error(`Resend refused the notice (${r.status}): ${detail.slice(0, 200)}`);
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    // El aviso es un extra: que falle no puede romper la inscripción.
+    console.error('Team signup notice:', e.message);
+    return res.json({ ok: false, note: 'request saved, notice failed' });
+  }
+});
+
 app.post('/game-invoices', async (req, res) => {
   const admin = await requireAdmin(req);
   if (!admin) return res.status(403).json({ error: 'Not authorized' });
