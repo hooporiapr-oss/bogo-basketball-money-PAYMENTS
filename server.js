@@ -461,7 +461,9 @@ app.post('/create-checkout-session', async (req, res) => {
 
 // Added to every pledge invoice as its own line. The program keeps
 // the pledge itself in full.
-const PLATFORM_FEE_PCT = 10;
+// El cargo de plataforma. Se suma encima del pago del padrino: el
+// programa recibe completo lo que recaudó, pase lo que pase aquí.
+const PLATFORM_FEE_PCT = 20;
 
 async function requireAdmin(req) {
   const auth = req.headers.authorization || '';
@@ -588,7 +590,7 @@ async function sendPledgeEmail(o) {
     hi: `Hola ${o.name},`,
     scored: `<strong>${o.who}</strong> anotó <strong>${o.points} puntos</strong>.`,
     pledged: `Prometiste ${money(o.rate)} por punto, así que tu promesa es de <strong>${money(o.pledged)}</strong>.`,
-    feeLine: `Cargo de plataforma (10%)`,
+    feeLine: `Cargo de plataforma (${PLATFORM_FEE_PCT}%)`,
     totalLine: `Total a pagar`,
     pay: `Pagar ${money(o.amount)}`,
     goes: `Los ${money(o.pledged)} de tu promesa van completos a ${o.teamName}.`,
@@ -603,7 +605,7 @@ async function sendPledgeEmail(o) {
     hi: `Hi ${o.name},`,
     scored: `<strong>${o.who}</strong> scored <strong>${o.points} points</strong>.`,
     pledged: `You pledged ${money(o.rate)} a point, so your pledge comes to <strong>${money(o.pledged)}</strong>.`,
-    feeLine: `Platform fee (10%)`,
+    feeLine: `Platform fee (${PLATFORM_FEE_PCT}%)`,
     totalLine: `Total to pay`,
     pay: `Pay ${money(o.amount)}`,
     goes: `The ${money(o.pledged)} you pledged goes to ${o.teamName} in full.`,
@@ -652,7 +654,7 @@ async function sendPledgeEmail(o) {
     `${t.hi}\n\n${nudge ? nudge + '\n\n' : ''}` +
     `${o.who} scored ${o.points} points.\n` +
     `Your pledge: ${money(o.pledged)}\n` +
-    `Platform fee (10%): ${money(o.platformAmount)}\n` +
+    `Platform fee (${PLATFORM_FEE_PCT}%): ${money(o.platformAmount)}\n` +
     `Total: ${money(o.amount)}\n\n` +
     `Pay here: ${o.payUrl}\n`;
 
@@ -1144,7 +1146,7 @@ async function sendGameEmail(o) {
       <table style="width:100%;border-collapse:collapse;margin:14px 0">
         <tr><td style="padding:7px 0;border-bottom:1px solid #D7E0E8">Your pledge</td>
             <td style="padding:7px 0;border-bottom:1px solid #D7E0E8;text-align:right">${money(o.pledged)}</td></tr>
-        <tr><td style="padding:7px 0;border-bottom:1px solid #D7E0E8;color:#5A6B7C">Platform fee (10%)</td>
+        <tr><td style="padding:7px 0;border-bottom:1px solid #D7E0E8;color:#5A6B7C">Platform fee (${PLATFORM_FEE_PCT}%)</td>
             <td style="padding:7px 0;border-bottom:1px solid #D7E0E8;text-align:right;color:#5A6B7C">${money(o.platformAmount)}</td></tr>
         <tr><td style="padding:9px 0;font-weight:800">Total</td>
             <td style="padding:9px 0;text-align:right;font-weight:800">${money(o.amount)}</td></tr>
@@ -1170,7 +1172,7 @@ async function sendGameEmail(o) {
     `Hi ${o.name},\n\n` +
     `You pledged ${money(o.rate)} a point.\n` +
     `Your pledge: ${money(o.pledged)}\n` +
-    `Platform fee (10%): ${money(o.platformAmount)}\n` +
+    `Platform fee (${PLATFORM_FEE_PCT}%): ${money(o.platformAmount)}\n` +
     `Total: ${money(o.amount)}\n\n` +
     `Pay here: ${o.payUrl}\n\n` +
     `The program receives your full ${money(o.pledged)}.\n` +
