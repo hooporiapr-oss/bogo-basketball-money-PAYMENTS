@@ -829,6 +829,109 @@ async function sendGameThanks(o) {
 //  avisa, para no tener que estar mirando el admin. Si el correo
 //  falla, la petición sigue ahí.
 // ══════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════
+//  Aviso: un coach puso un marcador
+//
+//  Un equipo en Florida pone su marcador a las once de la noche
+//  y las promesas quedan listas para cobrar. Sin este aviso hay
+//  que estar mirando el admin por si acaso.
+// ══════════════════════════════════════════════════════════════
+app.post('/score-posted', async (req, res) => {
+  const { game_id } = req.body || {};
+  if (!game_id) return res.status(400).json({ error: 'game_id is required' });
+
+  try {
+    const { data: game } = await supabase
+      .from('games')
+      .select('id, campaign_id, opponent, plays_on, home, team_points, opp_points, note')
+      .eq('id', game_id)
+      .single();
+
+    if (!game) return res.json({ ok: false, note: 'no game' });
+
+    const { data: pledges } = await supabase
+      .from('game_pledges')
+      .select('team_amount, invoice_status')
+      .eq('game_id', game_id);
+
+    const open = (pledges || []).filter(p => p.invoice_status === 'open');
+
+    // Sin promesas no hay nada que hacer, así que no se avisa: un
+    // correo por cada juego de cada equipo sería ruido.
+    if (!open.length) return res.json({ ok: true, notified: false });
+
+    const due = open.reduce((n, p) => n + Number(p.team_amount || 0), 0);
+
+    const { data: camp } = await supabase
+      .from('campaigns').select('name').eq('id', game.campaign_id).single();
+
+    const team = (camp && camp.name) || 'A program';
+    const label = `${game.home ? 'vs' : '@'} ${game.opponent}`;
+    const to = process.env.ADMIN_EMAIL || 'gostardigital@gmail.com';
+
+    const html = `
+      <div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#12202E">
+        <p style="font-size:.72rem;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:#0B7A5A;margin:0 0 6px">
+          Listo para cobrar
+        </p>
+        <h1 style="font-size:1.35rem;margin:0 0 4px">${team} ${label}</h1>
+        <p style="margin:0 0 16px;color:#5A6B7C">
+          ${game.plays_on || ''} · Final <b style="color:#12202E">${game.team_points}</b>${
+            game.opp_points != null ? ` – ${game.opp_points}` : ''}
+        </p>
+
+        <table style="width:100%;border-collapse:collapse;font-size:.95rem">
+          <tr><td style="padding:7px 0;border-bottom:1px solid #D7E0E8">Promesas sin cobrar</td>
+              <td style="padding:7px 0;border-bottom:1px solid #D7E0E8;text-align:right"><b>${open.length}</b></td></tr>
+          <tr><td style="padding:7px 0">Para el programa</td>
+              <td style="padding:7px 0;text-align:right"><b>$${due.toFixed(2)}</b></td></tr>
+        </table>
+
+        <p style="margin:18px 0 0;color:#5A6B7C;font-size:.9rem">
+          Manda los enlaces de pago desde el admin.
+        </p>
+        <p style="color:#5A6B7C;font-size:.8rem;margin-top:20px">
+          Gostar Digital LLC · Puerto Rico
+        </p>
+      </div>`;
+
+    const text =
+      `${team} ${label} — ${game.plays_on || ''}\n` +
+      `Final: ${game.team_points}${game.opp_points != null ? ' – ' + game.opp_points : ''}\n\n` +
+      `${open.length} promesa(s) sin cobrar · $${due.toFixed(2)} para el programa.\n` +
+      `Manda los enlaces de pago desde el admin.\n`;
+
+    if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
+
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: MAIL_FROM,
+        to: [to],
+        ...(MAIL_REPLY_TO ? { reply_to: MAIL_REPLY_TO } : {}),
+        subject: `Listo para cobrar: ${team} ${label}`,
+        html, text,
+      }),
+    });
+
+    if (!r.ok) {
+      const detail = await r.text().catch(() => '');
+      throw new Error(`Resend refused the notice (${r.status}): ${detail.slice(0, 200)}`);
+    }
+
+    return res.json({ ok: true, notified: true, pledges: open.length });
+  } catch (e) {
+    // El aviso es un extra: que falle no puede romper nada.
+    console.error('Score notice:', e.message);
+    return res.json({ ok: false, note: 'notice failed' });
+  }
+});
+
 app.post('/team-signup', async (req, res) => {
   const { team, program, coach, email, phone } = req.body || {};
 
