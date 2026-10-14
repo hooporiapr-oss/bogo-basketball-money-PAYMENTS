@@ -1516,6 +1516,311 @@ app.post('/send-reminders', async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════
+//  POST /coach/chat — la ayuda del entrenador, contestada.
+//
+//  Dos reglas, y las dos se cumplen aquí dentro y no en el navegador:
+//
+//  1. Sólo entra quien tiene código. Se comprueba AQUÍ con
+//     builder_check. Que la página ya lo haya comprobado no cuenta:
+//     cualquiera puede llamar a este endpoint a mano.
+//
+//  2. Lo de dinero NO lo contesta el modelo. Nunca. Cuándo se paga,
+//     el 20%, el tope del padrino, los impuestos — eso sale de DINERO
+//     palabra por palabra, el mismo texto que está en ayuda.html. Y si
+//     el modelo devuelve una cifra de todas formas, se tira la
+//     respuesta entera. Un entrenador que recibe una fecha de pago
+//     equivocada de algo que lleva nuestro logo nos cuesta el programa.
+// ══════════════════════════════════════════════════════════════════
+
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+// Se puede cambiar en Render sin tocar el código.
+const COACH_CHAT_MODEL = process.env.COACH_CHAT_MODEL || 'claude-haiku-5-5';
+
+// ── Los topes ───────────────────────────────────────────
+// Todos se cambian en Render sin tocar el código. El que de verdad
+// protege la factura es el tercero: es el techo del día entero,
+// entren los entrenadores que entren.
+const topeDe = (v, porDefecto) => {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n >= 0 ? n : porDefecto;
+};
+const LIM_HORA  = topeDe(process.env.COACH_CHAT_PER_HOUR, 12);   // por entrenador
+const LIM_DIA   = topeDe(process.env.COACH_CHAT_PER_DAY, 30);    // por entrenador
+const LIM_TODOS = topeDe(process.env.COACH_CHAT_TOTAL_DAY, 250); // entre todos
+// Interruptor de emergencia: COACH_CHAT_OFF=1 y el chat se apaga sin
+// tener que quitar la llave ni desplegar nada.
+const CHAT_APAGADO = String(process.env.COACH_CHAT_OFF || '') === '1';
+
+// Lo que el entrenador puede preguntar y el modelo sí puede contestar.
+// Es el mismo contenido de ayuda.html menos la sección El dinero, que
+// no pasa por aquí.
+const COACH_KB = `Eres la ayuda de Cada Punto para entrenadores. Cada Punto es
+una recaudación por promesas: los padrinos prometen unos centavos por punto que
+anote el equipo, y cuando el entrenador pone el marcador se cierra el juego y se
+cobra.
+
+Contesta SOLO con lo que está aquí abajo. Hablas con un entrenador, no con un
+padrino.
+
+ENTRAR
+- Entra en cadapunto.com/mi-equipo.html con el código que se le dio.
+- Se escribe una sola vez: ese teléfono queda sabiendo quién es, para el
+  calendario, la plantilla y el marcador.
+- Si se lo vuelve a pedir, está en otro teléfono, otro navegador o una ventana
+  privada.
+- Si dice que el código no sirve: casi siempre son espacios pegados al copiar y
+  pegar. Si sigue, que escriba al correo.
+- Códigos perdidos no se pueden buscar: se guardan cifrados. Se hace uno nuevo.
+
+LA PLANTILLA (cadapunto.com/plantilla.html)
+- Dos maneras de apuntar jugadores, y valen a la vez: el entrenador pega los
+  nombres uno por línea, o manda el enlace de apuntarse al grupo del equipo y
+  cada familia se apunta sola. La segunda es la buena: cada nene recibe su
+  propio enlace para sus padrinos.
+- Un nene que se apuntó y no aparece está esperando aprobación. Sale arriba, en
+  un recuadro anaranjado, con Aprobar y Rechazar. Mientras no se apruebe no sale
+  en ningún sitio, y es a propósito.
+- Se fue un nene: botón Sacar. Baja al final en gris y deja de salir en el
+  tablero. No se borra y vuelve con un toque. Borrar sale después de sacarlo, y
+  no se puede si ya tiene promesas encima.
+- Nombre mal escrito: botón Arreglar, en su fila. Ahí mismo se le cambia la
+  escuadra.
+
+LOS JUEGOS
+- Poner juegos: desde Mi equipo. Fecha, hora y contra quién. Se puede poner toda
+  la temporada de una vez.
+- Interescuadra: desde Mi equipo, Escuadras. Se parte la plantilla en dos, se
+  pone fecha y hora, y se crean los dos juegos de una vez. Son dos y no uno a
+  propósito: los padrinos prometen por juego, así que cada escuadra tiene que ser
+  el equipo en su propia fila. Si hubiera un solo juego, las familias de la otra
+  mitad no tendrían nada que apadrinar ese día.
+- Las promesas se cierran a la hora del juego. Después de esa hora no entra
+  ninguna. Si la hora está mal puesta, se arregla y vuelve a abrirse.
+- Juego cancelado: que avise y lo cancelamos. No se le cobra a nadie por un
+  juego que no se jugó.
+
+EL MARCADOR
+- Se pone en el tablero del equipo: entra con su código, certifica una vez, y de
+  ahí cada juego son dos números y Guardar.
+- Si no lo deja poner, casi siempre es que el juego todavía no ha pasado. No se
+  puede poner el marcador de un juego que no se ha jugado.
+- Marcador equivocado: que avise el mismo día. Se corrige y se les dice a los
+  padrinos. Un marcador que se cambia sin decirlo es de las tres cosas que
+  tumban un partido en las reglas de Sietes.
+- Mientras no esté puesto el marcador, no se le cobra a ningún padrino y el
+  programa no recibe nada. Por eso Mi equipo lo pone arriba en anaranjado.
+- Se recauda por los puntos que anotó el equipo, no por ganar. Perder no cambia
+  nada. En un interescuadra recaudan las dos escuadras, cada una por lo suyo.
+
+CÓMO CONTESTAS
+- En el idioma en que te preguntaron. Si te escriben en inglés, contestas en
+  inglés.
+- Corto: tres o cuatro frases. Dile qué botón tocar y en qué página.
+- Palabras llanas. Nada de jerga ni de listas largas.
+- No te inventes NADA. Ni una cifra, ni una fecha, ni un porcentaje, ni un plazo,
+  ni un nombre de página que no esté aquí arriba.
+- No prometas lo que vamos a hacer nosotros.
+- Nunca des códigos, nombres de nenes, ni nada de otro equipo. Si te lo piden,
+  dile que eso no lo puedes dar.
+- Si la pregunta no está contestada aquí arriba, dilo y manda a escribir a
+  gostardigital@gmail.com. Decir "no sé, escríbenos" es la respuesta correcta y
+  no es un fallo.
+- Eres una ayuda, no una persona. No tienes nombre y no dices que eres John ni
+  nadie de Gostar Digital.`;
+
+// ── Lo de dinero, palabra por palabra ─────────────────────────────
+// El mismo texto que ayuda.html y que cuadra con terms.html y
+// custodia.html. Si una de esas cambia, esto cambia. El modelo no
+// toca ninguna de estas respuestas.
+const DINERO = [
+  { k: /(cu[aá]ndo|cuando|when).{0,40}(me pag|pagan|cobro yo|remit|get paid|paid)|(pag|paid|remit).{0,25}(cu[aá]ndo|when)|d[ií]a 15|15th/i,
+    es: 'Te pagamos el día 1 y el día 15 de cada mes, por lo cobrado hasta ese día. Si por alguna razón no podemos remitir en esa fecha, te lo decimos antes de que pase.',
+    en: 'We pay on the 1st and the 15th of each month, for whatever has been collected by then. If for any reason we cannot send on that date, we tell you before it passes.' },
+
+  { k: /(a d[oó]nde|ad[oó]nde|donde).{0,30}(pag|cobr)|cobro\.html|ath m[oó]vil|where.{0,20}pay me|bank|cuenta de banco/i,
+    es: 'A donde nos digas en cadapunto.com/cobro.html, con el mismo código. Es la cuenta ATH Móvil Business de la organización. Hazlo una vez, al principio.',
+    en: 'Wherever you tell us at cadapunto.com/cobro.html, with the same code. It is the organisation’s ATH Móvil Business account. Do it once, at the start.' },
+
+  { k: /(cu[aá]nto|qu[eé]).{0,30}(se quedan|cobran ustedes|comisi[oó]n|se llevan)|20\s?%|veinte por ciento|how much.{0,20}keep|your cut|commission|fee/i,
+    es: 'Nada de lo tuyo. El programa recibe el 100% de lo prometido. Nuestro 20% se le suma al pago del padrino, encima de la promesa: una promesa de $25 es un pago de $25.00 más $5.00, y al programa le llegan los $25 completos. Sin cuota de entrada, sin mensualidad y sin contrato.',
+    en: 'Nothing of yours. The program receives 100% of what was pledged. Our 20% is added to the padrino’s payment, on top of the pledge: a $25 pledge is a payment of $25.00 plus $5.00, and the program receives the full $25. No setup fee, no monthly fee, no contract.' },
+
+  { k: /deducib|impuesto|tax|irs|recibo para|hacienda|donaci[oó]n deduc|write ?off|501/i,
+    es: 'No decimos que lo sea. Gostar Digital LLC es una empresa con fines de lucro, no una organización sin fines de lucro, y no emitimos recibos para impuestos. Si a un padrino le importa cómo se trata su pago, que lo consulte con su asesor.',
+    en: 'We do not say that it is. Gostar Digital LLC is a for-profit company, not a non-profit, and we do not issue tax receipts. If how their payment is treated matters to a padrino, they should ask their own advisor.' },
+
+  { k: /(tope|m[aá]ximo|l[ií]mite|fortuna|m[ií]nimo|minimum|cap\b|owe|debiendo|deber[aá]|too much)/i,
+    es: 'El padrino pone su propio tope cuando promete, y el tope manda — no puede terminar debiendo más de eso. También hay un cobro mínimo de $5.',
+    en: 'The padrino sets their own cap when they pledge, and the cap wins — they cannot end up owing more than that. There is also a $5 minimum charge.' },
+
+  { k: /(cu[aá]ndo|cuando|when).{0,40}(cuenta|factura|cobr|bill|invoice|charge)|le llega la cuenta|les llega/i,
+    es: 'Cuando pones el marcador, el juego se cierra y se calcula lo de cada padrino. Las cuentas salen desde el admin, así que puede haber unas horas entre que pones el marcador y que les llega.',
+    en: 'When you post the score the game closes and every padrino’s amount is worked out. The bills go out from the admin side, so there can be a few hours between your posting the score and their receiving it.' },
+];
+
+// Cualquier otra cosa que huela a dinero y no sea una de las de arriba
+// tampoco la contesta el modelo. Va a la página y al correo.
+const OLOR_A_DINERO = /\$|dinero|plata|pago|pagar|pagos|cobr|factura|precio|cuesta|tarifa|por ciento|%|money|payment|pay\b|paid|charge|refund|reembolso|devoluci[oó]n|stripe|tarjeta|card\b|banco|bank/i;
+
+const SIN_CIFRAS = {
+  es: 'Eso es de dinero, y no te lo voy a contestar de memoria. Está escrito en la sección El dinero de esta misma página — bájale y ábrela. Si lo que preguntas no está ahí, escríbenos a gostardigital@gmail.com y te contestamos el mismo día.',
+  en: 'That is a money question, and I will not answer it from memory. It is written out in The money section of this same page — scroll down and open it. If what you are asking is not there, write to gostardigital@gmail.com and we answer the same day.',
+};
+
+// ¿En qué idioma pregunta? Una tilde, una ñ o un signo de abrir ya
+// lo deciden. Si no trae ninguno — y mucha gente escribe sin tildes —
+// se cuentan palabras de cada lado y gana la que tenga más. Mirar sólo
+// si había palabras inglesas contestaba en español a "is this tax
+// deductible", que no lleva ninguna de las palabras obvias.
+const PAL_ES = /\b(que|como|cuando|donde|cual|cuanto|para|por|porque|mi|mis|me|el|la|los|las|un|una|del|con|hay|esto|esta|eso|no|si|puedo|tengo|quiero|juego|juegos|marcador|equipo|codigo|jugador|jugadores|nene|nenes|plantilla|escuadra|padrino|padrinos|pongo|poner|apunt\w*|sirve)\b/g;
+const PAL_EN = /\b(the|is|are|was|how|when|what|where|why|which|do|does|did|can|could|should|my|i|you|it|this|that|they|not|and|of|for|with|score|roster|game|games|team|pay|paid|sign|player|players|code|squad|padrino|padrinos|cannot|about)\b/g;
+function idioma(t) {
+  const s = String(t || '').toLowerCase();
+  if (/[áéíóúñ¿¡]/.test(s)) return 'es';
+  const es = (s.match(PAL_ES) || []).length;
+  const en = (s.match(PAL_EN) || []).length;
+  return en > es ? 'en' : 'es';
+}
+
+// La cuenta va en la base, no en memoria. En memoria tenía un agujero:
+// Render reinicia el servicio cuando le parece y en cada reinicio la
+// cuenta volvía a cero. Un tope que se borra solo no es un tope.
+//
+// No se guarda el código, se guarda un hash. Esa tabla no sirve para
+// entrar en ningún sitio.
+const crypto = require('crypto');
+const huella = (code) =>
+  crypto.createHash('sha256').update(String(code)).digest('hex').slice(0, 24);
+
+// Sube los tres cubos y dice cómo quedaron. Si no se puede contar, NO
+// se llama al modelo — se falla cerrado. Entre dejar a un entrenador sin
+// respuesta un rato y una factura que no vimos venir, preferimos lo
+// primero: abajo tiene las 24 preguntas y el correo.
+async function pasaElTope(code) {
+  const ahora = new Date();
+  const dia = ahora.toISOString().slice(0, 10);
+  const hora = dia + 'T' + String(ahora.getUTCHours()).padStart(2, '0');
+  const h = huella(code);
+
+  const bH = 'h:' + h + ':' + hora;
+  const bD = 'd:' + h + ':' + dia;
+  const bT = 'all:' + dia;
+
+  const { data, error } = await supabase.rpc('coach_chat_bump', { p_buckets: [bH, bD, bT] });
+  if (error) {
+    console.error('coach/chat no se pudo contar:', error);
+    return { ok: false, motivo: 'contador' };
+  }
+  const c = data || {};
+  if ((c[bT] || 0) > LIM_TODOS) return { ok: false, motivo: 'todos' };
+  if ((c[bD] || 0) > LIM_DIA)   return { ok: false, motivo: 'dia' };
+  if ((c[bH] || 0) > LIM_HORA)  return { ok: false, motivo: 'hora' };
+  return { ok: true, hoy: c[bT] || 0 };
+}
+
+const TOPE_DICHO = {
+  hora: {
+    es: 'Son muchas preguntas seguidas. Espera un rato y sigue, o escríbenos a gostardigital@gmail.com y te contesta una persona.',
+    en: 'That is a lot of questions at once. Wait a while and carry on, or write to gostardigital@gmail.com and a person will answer you.' },
+  dia: {
+    es: 'Ya hiciste bastantes preguntas hoy. Mañana sigue, y mientras tanto escríbenos a gostardigital@gmail.com.',
+    en: 'You have asked plenty today. Carry on tomorrow, and in the meantime write to gostardigital@gmail.com.' },
+  todos: {
+    es: 'El chat llegó a su tope de hoy. Las preguntas de esta página están completas, y si no está lo tuyo escríbenos a gostardigital@gmail.com.',
+    en: 'The chat has reached today\u2019s limit. The questions on this page are complete, and if yours is not there write to gostardigital@gmail.com.' },
+  contador: {
+    es: 'No puedo contestarte ahora mismo. Las preguntas de esta página están completas, y si no está lo tuyo escríbenos a gostardigital@gmail.com.',
+    en: 'I cannot answer right now. The questions on this page are complete, and if yours is not there write to gostardigital@gmail.com.' },
+};
+
+app.post('/coach/chat', async (req, res) => {
+  try {
+    const code = String((req.body && req.body.code) || '').trim();
+    const inMsgs = Array.isArray(req.body && req.body.messages) ? req.body.messages : [];
+    if (!code) return res.status(400).json({ error: 'code is required' });
+    if (!inMsgs.length) return res.status(400).json({ error: 'messages is required' });
+
+    // 1. La puerta. Se comprueba aquí, no en el navegador.
+    const { data: chk, error: chkErr } = await supabase.rpc('builder_check', { p_code: code });
+    if (chkErr) {
+      console.error('coach/chat builder_check error:', chkErr);
+      return res.status(500).json({ error: 'check failed' });
+    }
+    if (!chk || !chk.ok) return res.status(401).json({ error: 'bad code' });
+
+    // Sólo las últimas, y cortadas. Nadie necesita mandar un libro.
+    const msgs = inMsgs
+      .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
+      .slice(-10)
+      .map((m) => ({ role: m.role, content: String(m.content).slice(0, 1200) }));
+    if (!msgs.length || msgs[msgs.length - 1].role !== 'user') {
+      return res.status(400).json({ error: 'last message must be from the user' });
+    }
+
+    const pregunta = msgs[msgs.length - 1].content;
+    const lang = idioma(pregunta);
+
+    // 2. El dinero no pasa por el modelo.
+    for (const d of DINERO) {
+      if (d.k.test(pregunta)) return res.json({ reply: d[lang] || d.es, fixed: true });
+    }
+    if (OLOR_A_DINERO.test(pregunta)) {
+      return res.json({ reply: SIN_CIFRAS[lang], fixed: true });
+    }
+
+    if (!ANTHROPIC_API_KEY || CHAT_APAGADO) return res.status(503).json({ error: 'chat is off' });
+
+    // El tope se mira AQUÍ, y no arriba, a propósito: las respuestas
+    // fijas de dinero no cuestan nada, así que no tienen por qué
+    // gastarle la cuota a nadie. Sólo cuenta lo que llega al modelo.
+    const tope = await pasaElTope(code);
+    if (!tope.ok) {
+      return res.status(429).json({ reply: TOPE_DICHO[tope.motivo][lang], fixed: true });
+    }
+
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: COACH_CHAT_MODEL,
+        max_tokens: 400,
+        temperature: 0.2,
+        system: COACH_KB,
+        messages: msgs,
+      }),
+    });
+
+    if (!r.ok) {
+      console.error('coach/chat model error:', r.status, await r.text());
+      return res.status(502).json({ error: 'model failed' });
+    }
+
+    const out = await r.json();
+    let reply = ((out.content || []).find((c) => c.type === 'text') || {}).text || '';
+    reply = reply.trim();
+    if (!reply) return res.status(502).json({ error: 'empty reply' });
+
+    // 3. El cinturón, por si el modelo se fue de cifras de todas
+    //    formas. Si trae un número de dinero o un porcentaje, la
+    //    respuesta se tira entera — no se recorta.
+    if (/\$\s?\d|\d+\s?%|\bpor ciento\b|\bpercent\b/i.test(reply)) {
+      console.warn('coach/chat: respuesta con cifras descartada');
+      return res.json({ reply: SIN_CIFRAS[lang], fixed: true });
+    }
+
+    console.log('coach/chat ok — preguntas al modelo hoy:', tope.hoy, 'de', LIM_TODOS);
+    res.json({ reply });
+  } catch (e) {
+    console.error('coach/chat error:', e);
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 app.get('/', (req, res) => res.send('Basketball Money payment server is running.'));
 
 // Sends the card link by email through Resend's HTTP API. No extra
