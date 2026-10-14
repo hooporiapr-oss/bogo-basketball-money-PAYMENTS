@@ -1787,9 +1787,12 @@ app.post('/coach/chat', async (req, res) => {
         'content-type': 'application/json',
       },
       body: JSON.stringify({
+        // Sin temperature: estos modelos piensan antes de contestar y
+        // no aceptan que se la toquemos. Y max_tokens tiene que dar
+        // para lo que piensa MÁS lo que escribe — con 400 se le iba
+        // entero en pensar y devolvía una respuesta vacía.
         model: COACH_CHAT_MODEL,
-        max_tokens: 400,
-        temperature: 0.2,
+        max_tokens: 1024,
         system: COACH_KB,
         messages: msgs,
       }),
@@ -1801,9 +1804,18 @@ app.post('/coach/chat', async (req, res) => {
     }
 
     const out = await r.json();
-    let reply = ((out.content || []).find((c) => c.type === 'text') || {}).text || '';
-    reply = reply.trim();
-    if (!reply) return res.status(502).json({ error: 'empty reply' });
+    // La respuesta puede venir en varios bloques, y el primero puede ser
+    // lo que pensó, no lo que dice. Se juntan los de texto y ya.
+    const reply = (out.content || [])
+      .filter((c) => c && c.type === 'text' && c.text)
+      .map((c) => c.text)
+      .join('\n')
+      .trim();
+    if (!reply) {
+      console.error('coach/chat respuesta sin texto — stop_reason:', out.stop_reason,
+                    '| bloques:', (out.content || []).map((c) => c.type).join(','));
+      return res.status(502).json({ error: 'empty reply' });
+    }
 
     // 3. El cinturón, por si el modelo se fue de cifras de todas
     //    formas. Si trae un número de dinero o un porcentaje, la
