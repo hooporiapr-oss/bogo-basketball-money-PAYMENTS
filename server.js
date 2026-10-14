@@ -1132,37 +1132,32 @@ async function sendGameEmail(o) {
 
   const subject = `${o.teamName} ${o.label} — ${o.points} points`;
 
+  // Esto es una cuenta, no un anuncio, y tiene que parecerlo. Gmail
+  // lee un botón grande de color, un wordmark en mayúsculas y una
+  // tabla con bordes como lo que son — la silueta de una plantilla de
+  // mercadeo — y lo manda a Promociones. Una cuenta en Promociones no
+  // se paga: el padrino no la ve, el programa cree que no quiso pagar,
+  // y el que termina persiguiendo a la gente eres tú.
+  //
+  // Así que: sin wordmark, sin botón de bloque, sin tabla. Una carta,
+  // con el enlace dentro del texto. Es lo que manda un banco cuando te
+  // cobra, y por eso llega.
   const html = `
-    <div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#12202E">
-      <p style="font-size:.75rem;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:#5A6B7C;margin:0 0 6px">
-        Cada Punto Cuenta
-      </p>
-      <h1 style="font-size:1.5rem;margin:0 0 4px">${o.teamName} ${o.label}</h1>
-      <p style="margin:0 0 18px;color:#5A6B7C">Final: <b style="color:#12202E">${o.points} points</b></p>
-
+    <div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#12202E;font-size:15px;line-height:1.6">
       <p>Hi ${o.name},</p>
-      <p>You pledged ${money(o.rate)} a point. Here is what that comes to:</p>
 
-      <table style="width:100%;border-collapse:collapse;margin:14px 0">
-        <tr><td style="padding:7px 0;border-bottom:1px solid #D7E0E8">Your pledge</td>
-            <td style="padding:7px 0;border-bottom:1px solid #D7E0E8;text-align:right">${money(o.pledged)}</td></tr>
-        <tr><td style="padding:7px 0;border-bottom:1px solid #D7E0E8;color:#5A6B7C">Platform fee (${PLATFORM_FEE_PCT}%)</td>
-            <td style="padding:7px 0;border-bottom:1px solid #D7E0E8;text-align:right;color:#5A6B7C">${money(o.platformAmount)}</td></tr>
-        <tr><td style="padding:9px 0;font-weight:800">Total</td>
-            <td style="padding:9px 0;text-align:right;font-weight:800">${money(o.amount)}</td></tr>
-      </table>
+      <p>${o.teamName} played ${o.label} and scored <b>${o.points} points</b>.
+         You pledged ${money(o.rate)} a point, so your pledge comes to
+         <b>${money(o.pledged)}</b>.</p>
 
-      <p style="margin:0 0 6px;color:#5A6B7C;font-size:.9rem">
-        The program receives your full ${money(o.pledged)} — our fee is added on top, never taken out of it.
-      </p>
+      <p>With the ${PLATFORM_FEE_PCT}% platform fee of ${money(o.platformAmount)} added on top,
+         the total is <b>${money(o.amount)}</b>.
+         ${o.teamName} receives your full ${money(o.pledged)} — the fee is added on top of
+         your pledge, never taken out of it.</p>
 
-      <a href="${o.payUrl}"
-         style="display:block;text-align:center;background:#12202E;color:#fff;text-decoration:none;
-                padding:15px;border-radius:4px;font-weight:800;margin:18px 0">
-        Pay ${money(o.amount)}
-      </a>
+      <p><a href="${o.payUrl}" style="color:#A84200;font-weight:bold">Pay ${money(o.amount)}</a></p>
 
-      <p style="color:#5A6B7C;font-size:.82rem;margin-top:20px">
+      <p style="color:#5A6B7C;font-size:13px;margin-top:22px">
         Gostar Digital LLC · Puerto Rico
       </p>
     </div>`;
