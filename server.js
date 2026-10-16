@@ -589,7 +589,9 @@ async function sendPledgeEmail(o) {
     subject2: `Última llamada — la promesa por ${o.who}`,
     hi: `Hola ${o.name},`,
     scored: `<strong>${o.who}</strong> anotó <strong>${o.points} puntos</strong>.`,
-    pledged: `Prometiste ${money(o.rate)} por punto, así que tu promesa es de <strong>${money(o.pledged)}</strong>.`,
+    pledged: o.cap
+      ? `Prometiste ${money(o.rate)} por punto, que serían ${money(o.bruto)} — pero pusiste un tope de ${money(o.cap)}, así que tu promesa es de <strong>${money(o.pledged)}</strong>.`
+      : `Prometiste ${money(o.rate)} por punto, así que tu promesa es de <strong>${money(o.pledged)}</strong>.`,
     feeLine: `Cargo de plataforma (${PLATFORM_FEE_PCT}%)`,
     totalLine: `Total a pagar`,
     pay: `Pagar ${money(o.amount)}`,
@@ -604,7 +606,9 @@ async function sendPledgeEmail(o) {
     subject2: `Last call — your pledge for ${o.who}`,
     hi: `Hi ${o.name},`,
     scored: `<strong>${o.who}</strong> scored <strong>${o.points} points</strong>.`,
-    pledged: `You pledged ${money(o.rate)} a point, so your pledge comes to <strong>${money(o.pledged)}</strong>.`,
+    pledged: o.cap
+      ? `You pledged ${money(o.rate)} a point, which would have come to ${money(o.bruto)} — but you set a ${money(o.cap)} cap, so your pledge is <strong>${money(o.pledged)}</strong>.`
+      : `You pledged ${money(o.rate)} a point, so your pledge comes to <strong>${money(o.pledged)}</strong>.`,
     feeLine: `Platform fee (${PLATFORM_FEE_PCT}%)`,
     totalLine: `Total to pay`,
     pay: `Pay ${money(o.amount)}`,
@@ -653,7 +657,7 @@ async function sendPledgeEmail(o) {
   const text =
     `${t.hi}\n\n${nudge ? nudge + '\n\n' : ''}` +
     `${o.who} scored ${o.points} points.\n` +
-    `Your pledge: ${money(o.pledged)}\n` +
+    `Your pledge: ${money(o.pledged)}${o.cap ? ` (capped at ${money(o.cap)})` : ''}\n` +
     `Platform fee (${PLATFORM_FEE_PCT}%): ${money(o.platformAmount)}\n` +
     `Total: ${money(o.amount)}\n\n` +
     `Pay here: ${o.payUrl}\n`;
@@ -1256,7 +1260,19 @@ app.post('/challenge-invoices', async (req, res) => {
       // The pledge belongs to the program in full. Our share is added
       // on top as its own line, so a coach can tell a sponsor
       // truthfully that every dollar they pledge reaches the team.
-      const pledged = +(Number(p.rate_per_point) * points).toFixed(2);
+      //
+      // EL TOPE. Un padrino promete por punto sin saber cuánto va a
+      // anotar el nene, así que puede poner un techo. Aquí es donde
+      // ese techo significa algo: guardado en la fila y no aplicado
+      // aquí, sería una promesa que el sistema no cumple.
+      //
+      // El tope limita LA PROMESA, no el total: el cargo de
+      // plataforma se sigue sumando encima, igual que siempre, y es
+      // lo que la página del padrino le enseñó antes de prometer.
+      const bruto = Number(p.rate_per_point) * points;
+      const tope  = (p.cap === null || p.cap === undefined) ? null : Number(p.cap);
+      const topado = tope !== null && tope > 0 && bruto > tope;
+      const pledged = +(topado ? tope : bruto).toFixed(2);
       const platformAmount = +(pledged * (PLATFORM_FEE_PCT / 100)).toFixed(2);
       const amount = +(pledged + platformAmount).toFixed(2);
       const teamAmount = pledged;
@@ -1322,6 +1338,10 @@ app.post('/challenge-invoices', async (req, res) => {
           who, points, teamName, lang,
           rate: Number(p.rate_per_point),
           pledged, platformAmount, amount,
+          // Para que el correo no diga una multiplicación que no se
+          // hizo: si el tope mordió, lo cuenta.
+          cap: topado ? tope : null,
+          bruto: topado ? +bruto.toFixed(2) : null,
           payUrl: `${payBase}/pay.html?p=${p.id}`,
           reminder: 0,
         });
