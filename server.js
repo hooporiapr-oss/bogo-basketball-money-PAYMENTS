@@ -654,13 +654,21 @@ async function sendPledgeEmail(o) {
       <p style="color:#555;">${t.thanks}</p>
     </div>`;
 
+  // La versión en texto se saca del MISMO t que el html, sin las
+  // etiquetas. Escrita aparte se quedaba en inglés aunque el padrino
+  // hubiera prometido en español, y no contaba lo que habría sido sin
+  // tope — o sea, decía "$5.00 (capped at $5.00)" y nada más. Quien lee
+  // el correo en texto plano merece la misma cuenta.
+  const sinTags = (h) => String(h).replace(/<[^>]+>/g, '');
+
   const text =
     `${t.hi}\n\n${nudge ? nudge + '\n\n' : ''}` +
-    `${o.who} scored ${o.points} points.\n` +
-    `Your pledge: ${money(o.pledged)}${o.cap ? ` (capped at ${money(o.cap)})` : ''}\n` +
-    `Platform fee (${PLATFORM_FEE_PCT}%): ${money(o.platformAmount)}\n` +
-    `Total: ${money(o.amount)}\n\n` +
-    `Pay here: ${o.payUrl}\n`;
+    `${sinTags(t.scored)}\n` +
+    `${sinTags(t.pledged)}\n\n` +
+    `${t.feeLine}: ${money(o.platformAmount)}\n` +
+    `${t.totalLine}: ${money(o.amount)}\n\n` +
+    `${o.payUrl}\n\n` +
+    `${sinTags(t.goes)}\n${t.window}\n`;
 
   // A send that does not happen must not be reported as one. Without
   // this the endpoint counts a link as sent while the padrino never
@@ -1199,21 +1207,26 @@ async function sendGameEmail(o) {
   }
 }
 
-app.post('/challenge-invoices', async (req, res) => {
-  const admin = await requireAdmin(req);
-  if (!admin) return res.status(403).json({ error: 'Not authorized' });
-
-  const { challenge_id } = req.body;
-  if (!challenge_id) return res.status(400).json({ error: 'challenge_id is required' });
-
-  try {
+// Cobrar un reto: una vez, con los puntos que haya en la base. Está
+// aparte de la ruta porque ahora la llaman dos: el admin a mano, y el
+// barrido cuando se cierra la ventana.
+async function cobrarReto(challenge_id) {
+  {
     const { data: challenge, error: chErr } = await supabase
       .from('challenges')
-      .select('id, name, team_share_pct, campaign_id, campaigns(name)')
+      // `game` decide a qué dominio va el enlace de pago, más abajo.
+      // Faltaba en este select, así que llegaba undefined y todo el
+      // mundo acababa en cadapunto.com — correcto para la escuela, no
+      // para un equipo.
+      .select('id, name, game, team_share_pct, campaign_id, campaigns(name)')
       .eq('id', challenge_id)
       .single();
 
-    if (chErr || !challenge) return res.status(404).json({ error: 'Challenge not found' });
+    if (chErr || !challenge) {
+      const e = new Error('Challenge not found');
+      e.status = 404;
+      throw e;
+    }
 
     const { data: runs } = await supabase
       .from('challenge_runs')
@@ -1237,7 +1250,9 @@ app.post('/challenge-invoices', async (req, res) => {
     const teamName = (challenge.campaigns && challenge.campaigns.name) || 'the program';
     const payBase = BASKETBALL_GAMES.indexOf(challenge.game) !== -1
       ? PAY_BASE.basketball : PAY_BASE.school;
-    const results = { sent: 0, skipped: 0, zero: 0, failed: 0, errors: [] };
+    // program/fees se acumulan para el aviso: un correo que dice
+    // "4 enlaces" sin decir cuánto no sirve de nada.
+    const results = { sent: 0, skipped: 0, zero: 0, failed: 0, program: 0, fees: 0, errors: [] };
 
     for (const p of pledges || []) {
       // A link already sent is never sent again — a padrino should
@@ -1347,6 +1362,8 @@ app.post('/challenge-invoices', async (req, res) => {
         });
 
         results.sent++;
+        results.program = +(results.program + teamAmount).toFixed(2);
+        results.fees    = +(results.fees + platformAmount).toFixed(2);
       } catch (e) {
         console.error(`Payment link failed for pledge ${p.id}:`, e.message);
         results.failed++;
@@ -1355,10 +1372,208 @@ app.post('/challenge-invoices', async (req, res) => {
     }
 
     console.log(`Challenge ${challenge_id} payment links —`, JSON.stringify(results));
-    res.json(results);
+    return results;
+  }
+}
+
+app.post('/challenge-invoices', async (req, res) => {
+  const admin = await requireAdmin(req);
+  if (!admin) return res.status(403).json({ error: 'Not authorized' });
+
+  const { challenge_id } = req.body;
+  if (!challenge_id) return res.status(400).json({ error: 'challenge_id is required' });
+
+  try {
+    res.json(await cobrarReto(challenge_id));
   } catch (e) {
     console.error('challenge-invoices error:', e);
-    res.status(500).json({ error: String(e) });
+    res.status(e.status || 500).json({ error: String(e.message || e) });
+  }
+});
+
+
+// ════════════════════════════════════════════════════
+//  EL BARRIDO
+//
+//  Un día de juego termina cuando se cierra la ventana, y a esa hora
+//  no hay nadie sentado delante del admin. Sin esto, las promesas se
+//  quedan ahí: el nene jugó, el padrino prometió, y nadie cobra.
+//
+//  Qué hace que un reto se cobre, y no antes:
+//
+//    live = true          — lo pusiste en vivo tú
+//    closes_at con hora   — le pusiste ventana tú, a mano
+//    esa hora ya pasó     — más dos minutos de gracia
+//    billed_at vacío      — no se ha cobrado todavía
+//
+//  Las dos primeras las decides tú al abrir el día de juego. Eso ES
+//  la autorización: no hace falta volver a apretar nada.
+//
+//  Los dos minutos de gracia son por el reloj: la ventana la cierra
+//  Postgres con su now(), y este barrido corre en Node. Si el de Node
+//  va adelantado, un cuarto que entró con la chicharra podría quedar
+//  fuera del cobro. Dos minutos cubren cualquier desfase.
+//
+//  billed_at se reclama ANTES de cobrar, con un update condicionado a
+//  que siga vacío: dos ticks a la vez, o un reinicio en medio, no
+//  pueden mandar dos enlaces. Y si algo se cae a mitad, cada promesa
+//  ya cobrada tiene su pay_link_id, así que un barrido a mano después
+//  manda sólo las que faltan.
+//
+//  Y manda un correo. Que no haya nadie mirando no quiere decir que
+//  nadie se entere.
+// ════════════════════════════════════════════════════
+
+const SWEEP_KEY   = process.env.SWEEP_KEY || '';
+const SWEEP_EVERY = 5 * 60 * 1000;
+const GRACIA      = 2 * 60 * 1000;
+let barriendo = false;
+
+async function barrerRetos() {
+  if (barriendo) return { busy: true, challenges: 0, detail: [] };
+  barriendo = true;
+
+  const hecho = [];
+  try {
+    const corte = new Date(Date.now() - GRACIA).toISOString();
+
+    const { data: retos, error } = await supabase
+      .from('challenges')
+      .select('id, name, closes_at, campaign_id, campaigns(name)')
+      .eq('live', true)
+      .is('billed_at', null)
+      .not('closes_at', 'is', null)
+      .lt('closes_at', corte);
+
+    if (error) throw error;
+
+    for (const r of retos || []) {
+      // La reclamación. Si otro tick llegó primero, este no cobra.
+      const { data: mio, error: clErr } = await supabase
+        .from('challenges')
+        .update({ billed_at: new Date().toISOString() })
+        .eq('id', r.id)
+        .is('billed_at', null)
+        .select('id');
+
+      if (clErr) { console.error(`Barrido ${r.id}:`, clErr.message); continue; }
+      if (!mio || !mio.length) continue;
+
+      let out;
+      try {
+        out = await cobrarReto(r.id);
+      } catch (e) {
+        console.error(`Barrido ${r.id}:`, e.message);
+        out = { sent: 0, skipped: 0, zero: 0, failed: 1, program: 0, fees: 0,
+                errors: [String(e.message || e)] };
+      }
+
+      hecho.push(Object.assign({ id: r.id, name: r.name }, out));
+
+      // Un aviso que falla no deshace un cobro que ya salió.
+      try { await avisoDeBarrido(r, out); }
+      catch (e) { console.error('Aviso de barrido:', e.message); }
+    }
+  } finally {
+    barriendo = false;
+  }
+
+  if (hecho.length) console.log('Barrido —', JSON.stringify(hecho));
+  return { challenges: hecho.length, detail: hecho };
+}
+
+async function avisoDeBarrido(reto, out) {
+  const to = process.env.ADMIN_EMAIL || 'gostardigital@gmail.com';
+  const money = (n) => '$' + Number(n || 0).toFixed(2);
+  const equipo = (reto.campaigns && reto.campaigns.name) || '';
+
+  const fila = (k, v) =>
+    `<tr><td style="padding:6px 16px 6px 0;color:#5A6B7C">${k}</td>` +
+    `<td style="padding:6px 0;font-weight:700">${v}</td></tr>`;
+
+  const html = `
+    <div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#12202E;font-size:15px;line-height:1.6">
+      <p>Se cerró la ventana de <b>${reto.name || 'un reto'}</b>${equipo ? ' — ' + equipo : ''},
+         y los enlaces de pago salieron solos.</p>
+
+      <table style="border-collapse:collapse;font-size:14px;margin:14px 0">
+        ${fila('Enlaces mandados', out.sent)}
+        ${fila('Para el programa', money(out.program))}
+        ${fila('Cargo de plataforma', money(out.fees))}
+        ${out.zero ? fila('Sin puntos, cerradas', out.zero) : ''}
+        ${out.skipped ? fila('Ya tenían enlace', out.skipped) : ''}
+        ${out.failed ? fila('<span style="color:#A84200">Fallaron</span>',
+                            `<span style="color:#A84200">${out.failed}</span>`) : ''}
+      </table>
+
+      ${out.failed ? `<p style="color:#A84200;font-size:14px">${
+          (out.errors || []).map(e => String(e)).join('<br>')
+        }</p><p style="font-size:14px">Las que fallaron no tienen enlace, así que
+        volver a cobrar el reto manda sólo esas.</p>` : ''}
+
+      <p style="color:#5A6B7C;font-size:13px;margin-top:22px">
+        Gostar Digital LLC · Puerto Rico
+      </p>
+    </div>`;
+
+  const text =
+    `Se cerró ${reto.name || 'un reto'}${equipo ? ' — ' + equipo : ''}.\n\n` +
+    `Enlaces mandados: ${out.sent}\n` +
+    `Para el programa: ${money(out.program)}\n` +
+    `Cargo de plataforma: ${money(out.fees)}\n` +
+    (out.zero ? `Sin puntos: ${out.zero}\n` : '') +
+    (out.failed ? `Fallaron: ${out.failed}\n${(out.errors || []).join('\n')}\n` : '');
+
+  if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
+
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: MAIL_FROM,
+      to: [to],
+      ...(MAIL_REPLY_TO ? { reply_to: MAIL_REPLY_TO } : {}),
+      subject: `Cobrado: ${reto.name || 'reto'}${equipo ? ' — ' + equipo : ''}`,
+      html, text,
+    }),
+  });
+
+  if (!r.ok) {
+    const detail = await r.text().catch(() => '');
+    throw new Error(`Resend refused the notice (${r.status}): ${detail.slice(0, 200)}`);
+  }
+}
+
+// Forzar el barrido desde fuera. Dos llaves lo abren: la SWEEP_KEY
+// (para un cron de verdad, que no tiene con qué firmar como usuario)
+// o el token de un admin.
+app.post('/challenge-sweep', async (req, res) => {
+  let quien = null;
+
+  const dada = String(req.headers['x-sweep-key'] || '');
+  if (SWEEP_KEY && dada.length === SWEEP_KEY.length) {
+    // Comparar llaves con === filtra por el primer carácter que
+    // difiere. timingSafeEqual tarda lo mismo pase lo que pase.
+    try {
+      if (crypto.timingSafeEqual(Buffer.from(dada), Buffer.from(SWEEP_KEY))) {
+        quien = 'sweep-key';
+      }
+    } catch (e) { /* longitudes distintas: no es la llave */ }
+  }
+
+  if (!quien) quien = await requireAdmin(req);
+  if (!quien) return res.status(403).json({ error: 'Not authorized' });
+
+  try {
+    const out = await barrerRetos();
+    console.log(`Barrido a mano por ${quien} — ${out.challenges} reto(s)`);
+    return res.json(out);
+  } catch (e) {
+    console.error('Barrido:', e);
+    return res.status(500).json({ error: String(e.message || e) });
   }
 });
 
@@ -2016,3 +2231,19 @@ function randToken() {
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Payment server listening on ${port}`));
+
+// El barrido cada cinco minutos, y uno al arrancar: si Render reinició
+// el servicio justo cuando se cerraba una ventana, el tick siguiente
+// podría tardar, y el de arranque lo coge. Treinta segundos de margen
+// para que el servicio esté entero antes de cobrarle a nadie.
+//
+// Si este servicio se duerme (plan gratis), el reloj se duerme con él.
+// Entonces hace falta que algo de fuera le llame a /challenge-sweep
+// con la SWEEP_KEY, o simplemente a / para despertarlo.
+setTimeout(() => {
+  barrerRetos().catch(e => console.error('Barrido de arranque:', e.message));
+}, 30 * 1000);
+
+setInterval(() => {
+  barrerRetos().catch(e => console.error('Barrido:', e.message));
+}, SWEEP_EVERY);
