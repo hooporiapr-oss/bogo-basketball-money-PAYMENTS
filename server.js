@@ -706,6 +706,178 @@ async function sendPledgeEmail(o) {
 //  checkout for whatever they choose rather than only the exact
 //  figure — the pledge is a promise, not a debt collector.
 // ══════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════
+//  CONNECT — EL DINERO VA A LA CUENTA DEL PROGRAMA
+//
+//  Antes: el pago entraba a la cuenta de Gostar y se remitía el 1 y
+//  el 15. Ahora el cargo se crea aquí, se queda nuestro 20% y el
+//  resto se transfiere en el acto a la cuenta del programa. Es un
+//  destination charge: nosotros somos el comercio de registro, el
+//  cargo de Stripe sale de NUESTRO saldo, y por eso al programa le
+//  queda el 80% plano sin cuentas de centavos por transacción.
+//
+//  Lo que esto NO cambia: el cobro sigue siendo nuestro trabajo. Los
+//  enlaces, los recordatorios de los siete y los veintiún días, el
+//  cierre a los treinta. Lo único que ya no hacemos es guardar el
+//  dinero.
+//
+//  LA RAMPA: mientras una campaña no tenga cuenta conectada y activa,
+//  el cobro sigue por el camino viejo. No es un segundo producto — es
+//  lo que evita que el día del despliegue se rompan las campañas que
+//  ya están corriendo. Cuando todas estén conectadas, esto se borra.
+//
+//  QUIÉN PUEDE CONECTAR: el entrenador, con su código, y sólo las
+//  campañas que su código abre. builder_check devuelve esa lista y
+//  aquí se comprueba la pertenencia. Que la página ya lo haya
+//  comprobado no cuenta: cualquiera puede llamar a esto a mano.
+// ══════════════════════════════════════════════════════
+
+const CONNECT_PAIS = process.env.CONNECT_COUNTRY || 'US';
+
+/* El código y la campaña, juntos. Devolver la campaña entera y no un
+   booleano es lo que deja al resto del endpoint leer stripe_account_id
+   sin hacer otra consulta. */
+async function campanaDelCodigo(code, campaign_id) {
+  if (!code || !campaign_id) return { ok: false, code: 400, error: 'code and campaign_id are required' };
+
+  const { data: chk, error } = await supabase.rpc('builder_check', { p_code: String(code) });
+  if (error) { console.error('connect builder_check:', error.message); return { ok: false, code: 500, error: 'check failed' }; }
+  if (!chk || !chk.ok) return { ok: false, code: 401, error: 'bad code' };
+
+  const mias = Array.isArray(chk.campaigns) ? chk.campaigns : [];
+  if (!mias.some((c) => c && String(c.id) === String(campaign_id))) {
+    // El código es bueno pero esa campaña no es suya. No se dice cuál
+    // de las dos cosas falló: con un código válido, enumerar campañas
+    // ajenas por el mensaje de error sería un regalo.
+    return { ok: false, code: 403, error: 'not your campaign' };
+  }
+
+  const { data: camp } = await supabase
+    .from('campaigns')
+    .select('id, name, stripe_account_id, stripe_status, stripe_connected_at')
+    .eq('id', campaign_id)
+    .single();
+
+  if (!camp) return { ok: false, code: 404, error: 'campaign not found' };
+  return { ok: true, camp, by: chk.by || '' };
+}
+
+/* Lo que diga Stripe, no lo que creamos nosotros. */
+function estadoDeCuenta(acct) {
+  if (!acct) return 'pending';
+  if (acct.charges_enabled && acct.payouts_enabled) return 'active';
+  const falta = (acct.requirements && (acct.requirements.currently_due || [])) || [];
+  const pasada = (acct.requirements && (acct.requirements.past_due || [])) || [];
+  if (acct.requirements && acct.requirements.disabled_reason) return 'restricted';
+  if (pasada.length) return 'restricted';
+  return falta.length ? 'pending' : 'pending';
+}
+
+async function guardarEstado(campaign_id, acct) {
+  const estado = estadoDeCuenta(acct);
+  const patch = { stripe_status: estado };
+  if (estado === 'active') patch.stripe_connected_at = new Date().toISOString();
+  await supabase.from('campaigns').update(patch).eq('id', campaign_id);
+  return estado;
+}
+
+// ── Empezar o retomar el alta ─────────────────────────
+app.post('/connect/start', async (req, res) => {
+  try {
+    const { code, campaign_id } = req.body || {};
+    const a = await campanaDelCodigo(code, campaign_id);
+    if (!a.ok) return res.status(a.code).json({ error: a.error });
+
+    let acctId = a.camp.stripe_account_id;
+
+    if (!acctId) {
+      const acct = await stripe.accounts.create({
+        type: 'express',
+        country: CONNECT_PAIS,
+        /* business_type NO se pone a propósito. Un programa puede ser
+           una escuela, un club sin fines de lucro o una corporación, y
+           adivinarlo mal bloquea la activación. El formulario de
+           Stripe se lo pregunta a quien de verdad lo sabe. */
+        metadata: { campaign_id: String(campaign_id), campaign: a.camp.name || '' },
+        /* SÓLO transfers. card_payments es lo que necesita una cuenta
+           conectada para cobrar ELLA — un direct charge. Aquí el cargo
+           lo cobramos nosotros y a ella le llega una transferencia, así
+           que pedirle card_payments no sirve de nada y le carga al
+           tesorero del programa papeles que no hacen falta. Cada campo
+           de más es una razón más para no acabar el formulario. */
+        capabilities: { transfers: { requested: true } },
+        settings: { payouts: { schedule: { interval: 'daily' } } },
+      });
+
+      /* Reclamar el hueco, condicionado a que siga vacío. Dos clics
+         seguidos crearían dos cuentas de Stripe y el programa acabaría
+         con una huérfana que nadie mira. Si perdemos la carrera,
+         borramos la que acabamos de crear y usamos la que ganó. */
+      const { data: mio } = await supabase
+        .from('campaigns')
+        .update({ stripe_account_id: acct.id, stripe_status: 'pending' })
+        .eq('id', campaign_id)
+        .is('stripe_account_id', null)
+        .select('id');
+
+      if (mio && mio.length) {
+        acctId = acct.id;
+      } else {
+        try { await stripe.accounts.del(acct.id); }
+        catch (e) { console.error('Cuenta huérfana sin borrar', acct.id, e.message); }
+        const { data: c2 } = await supabase
+          .from('campaigns').select('stripe_account_id').eq('id', campaign_id).single();
+        acctId = c2 && c2.stripe_account_id;
+        if (!acctId) return res.status(500).json({ error: 'could not claim account' });
+      }
+    }
+
+    const base = PAY_BASE.school;
+    const link = await stripe.accountLinks.create({
+      account: acctId,
+      // Si el enlace caduca a mitad, Stripe manda al refresh y la
+      // página pide otro. Por eso los dos apuntan a cobro.html.
+      refresh_url: `${base}/cobro.html?c=${encodeURIComponent(campaign_id)}&reintentar=1`,
+      return_url: `${base}/cobro.html?c=${encodeURIComponent(campaign_id)}&listo=1`,
+      type: 'account_onboarding',
+    });
+
+    return res.json({ url: link.url });
+  } catch (e) {
+    console.error('connect/start:', e);
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// ── Releer el estado desde Stripe ─────────────────────
+app.post('/connect/status', async (req, res) => {
+  try {
+    const { code, campaign_id } = req.body || {};
+    const a = await campanaDelCodigo(code, campaign_id);
+    if (!a.ok) return res.status(a.code).json({ error: a.error });
+
+    if (!a.camp.stripe_account_id) {
+      return res.json({ estado: 'sin', puede_cobrar: false });
+    }
+
+    const acct = await stripe.accounts.retrieve(a.camp.stripe_account_id);
+    const estado = await guardarEstado(campaign_id, acct);
+
+    return res.json({
+      estado,
+      puede_cobrar: estado === 'active',
+      desde: a.camp.stripe_connected_at || null,
+      // Lo que Stripe todavía quiere, para poder decírselo al
+      // programa en vez de dejarlo mirando un "pendiente" sin más.
+      falta: (acct.requirements && acct.requirements.currently_due) || [],
+    });
+  } catch (e) {
+    console.error('connect/status:', e);
+    return res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+
 app.post('/pay-pledge', async (req, res) => {
   try {
     const { pledge_id, amount } = req.body;
@@ -721,7 +893,7 @@ app.post('/pay-pledge', async (req, res) => {
 
     const { data: p } = await supabase
       .from('pledges')
-      .select('*, players(name), challenges(name, campaigns(name))')
+      .select('*, players(name), challenges(name, campaigns(name, stripe_account_id, stripe_status))')
       .eq('id', pledge_id)
       .single();
 
@@ -733,6 +905,24 @@ app.post('/pay-pledge', async (req, res) => {
     const who = (p.players && p.players.name) || 'the program';
     const program = (p.challenges && p.challenges.campaigns && p.challenges.campaigns.name) || 'the program';
     const base = PAY_BASE.school;
+
+    /* A dónde va el dinero.
+       Si la campaña tiene cuenta conectada y activa, el 80% se
+       transfiere en el acto y nosotros nos quedamos el 20%. Si no, el
+       cargo entra entero a nuestra cuenta y se remite como antes — la
+       rampa, para no romper las campañas que ya corren.
+       El 20% se saca de lo que el padrino PAGA de verdad, no de lo que
+       se le facturó: esta página le deja redondear hacia arriba o
+       pagar menos, y el reparto tiene que seguir a lo que entró. */
+    const camp = (p.challenges && p.challenges.campaigns) || null;
+    const cuenta = camp && camp.stripe_status === 'active' ? camp.stripe_account_id : null;
+    const nuestro = Math.round(cents * (PLATFORM_FEE_PCT / 100));
+    const destino = cuenta ? {
+      payment_intent_data: {
+        application_fee_amount: nuestro,
+        transfer_data: { destination: cuenta },
+      },
+    } : {};
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
@@ -752,6 +942,7 @@ app.post('/pay-pledge', async (req, res) => {
         pledge_id: String(pledge_id),
         chosen_amount: String(cents),
       },
+      ...destino,
       ...(p.sponsor_email ? { customer_email: p.sponsor_email } : {}),
       success_url: `${base}/pay.html?p=${encodeURIComponent(pledge_id)}&paid=1`,
       cancel_url: `${base}/pay.html?p=${encodeURIComponent(pledge_id)}`,
@@ -1109,18 +1300,29 @@ app.post('/game-invoices', async (req, res) => {
           })
           .eq('id', p.id);
 
+        /* El tope, dicho. Si mordió, el correo tiene que contarlo:
+           "0.25 por punto × 68 puntos = $5.00" no cuadra, y un padrino
+           que no entiende su propia cuenta la disputa. */
+        const topado = p.cap != null && pledged < +raw.toFixed(2);
+
         await sendGameEmail({
           to: p.padrino_email,
           name: p.padrino_name,
           teamName, label, points,
           rate: Number(p.rate),
           pledged, platformAmount, amount,
+          cap: topado ? Number(p.cap) : null,
+          bruto: topado ? +raw.toFixed(2) : null,
           payUrl: link.url,
+          reminder: 0,
         });
 
-        // Sólo cuando el correo salió de verdad.
+        // Sólo cuando el correo salió de verdad. Y con la fecha: de
+        // aquí cuelgan los siete días, los veintiuno y el cierre a los
+        // treinta. Sin ella el barrido no sabe qué hacer con esta fila
+        // y la promesa se queda colgada para siempre.
         await supabase.from('game_pledges')
-          .update({ invoice_status: 'sent' })
+          .update({ invoice_status: 'sent', invoiced_at: new Date().toISOString() })
           .eq('id', p.id);
 
         results.sent++;
@@ -1142,7 +1344,22 @@ app.post('/game-invoices', async (req, res) => {
 async function sendGameEmail(o) {
   const money = (n) => '$' + Number(n).toFixed(2);
 
-  const subject = `${o.teamName} ${o.label} — ${o.points} points`;
+  /* Tres asuntos, no uno. Un recordatorio con el mismo asunto que la
+     cuenta original se apila debajo en el hilo y no se abre. */
+  const subject = o.reminder === 2
+    ? `Last call — ${o.teamName} ${o.label}`
+    : o.reminder === 1
+      ? `A reminder — ${o.teamName} ${o.label}`
+      : `${o.teamName} ${o.label} — ${o.points} points`;
+
+  /* Y una línea que dice por qué está escribiendo otra vez. La del
+     último dice que es el último, porque a los treinta días se cierra
+     y no se pide más. */
+  const nudge = o.reminder === 2
+    ? `This is the last reminder. After thirty days the pledge closes and nothing is owed.`
+    : o.reminder === 1
+      ? `We have not seen your payment yet — here is the link again, in case it got buried.`
+      : '';
 
   // Esto es una cuenta, no un anuncio, y tiene que parecerlo. Gmail
   // lee un botón grande de color, un wordmark en mayúsculas y una
@@ -1158,9 +1375,15 @@ async function sendGameEmail(o) {
     <div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#12202E;font-size:15px;line-height:1.6">
       <p>Hi ${o.name},</p>
 
+      ${nudge ? `<p>${nudge}</p>` : ''}
+
       <p>${o.teamName} played ${o.label} and scored <b>${o.points} points</b>.
-         You pledged ${money(o.rate)} a point, so your pledge comes to
-         <b>${money(o.pledged)}</b>.</p>
+         ${o.cap
+           ? `You pledged ${money(o.rate)} a point, which would have come to
+              ${money(o.bruto)} — but you set a ${money(o.cap)} cap, so your pledge is
+              <b>${money(o.pledged)}</b>.`
+           : `You pledged ${money(o.rate)} a point, so your pledge comes to
+              <b>${money(o.pledged)}</b>.`}</p>
 
       <p>With the ${PLATFORM_FEE_PCT}% platform fee of ${money(o.platformAmount)} added on top,
          the total is <b>${money(o.amount)}</b>.
@@ -1177,7 +1400,10 @@ async function sendGameEmail(o) {
   const text =
     `${o.teamName} ${o.label} — ${o.points} points\n\n` +
     `Hi ${o.name},\n\n` +
+    (nudge ? nudge + `\n\n` : '') +
     `You pledged ${money(o.rate)} a point.\n` +
+    (o.cap ? `Without your cap that would have been ${money(o.bruto)}.\n` +
+             `Your cap: ${money(o.cap)}\n` : '') +
     `Your pledge: ${money(o.pledged)}\n` +
     `Platform fee (${PLATFORM_FEE_PCT}%): ${money(o.platformAmount)}\n` +
     `Total: ${money(o.amount)}\n\n` +
@@ -1819,6 +2045,107 @@ async function recordarReto(challenge_id) {
   return results;
 }
 
+/* Lo mismo, para las promesas de un juego de baloncesto de verdad.
+   Tabla distinta y nombres de columna distintos — padrino_email en vez
+   de sponsor_email, rate en vez de rate_per_point, points en vez de
+   points_at_invoice — asi que es una funcion aparte y no una
+   generalizada con un mapa de columnas: el mapa se lee peor y se
+   rompe mas facil.
+   Lo que SI es igual, y tiene que serlo: los siete dias, los
+   veintiuno, el cierre a los treinta, y reclamar el contador antes de
+   mandar. A un padrino que ya recibio "este es el ultimo
+   recordatorio" no se le puede escribir otra vez, venga de la tabla
+   que venga. */
+async function recordarJuego(game_id) {
+  const { data: game } = await supabase
+    .from('games')
+    .select('id, opponent, home, plays_on, campaign_id, campaigns(name)')
+    .eq('id', game_id)
+    .single();
+
+  if (!game) return { error: 'Game not found' };
+
+  const { data: pledges } = await supabase
+    .from('game_pledges')
+    .select('*')
+    .eq('game_id', game_id)
+    .eq('invoice_status', 'sent');
+
+  const teamName = (game.campaigns && game.campaigns.name) || 'the program';
+  const label = `${game.home ? 'vs' : '@'} ${game.opponent}`;
+  const now = Date.now();
+  const days = (iso) => (now - new Date(iso).getTime()) / 86400000;
+
+  const results = { sent: 0, notDue: 0, done: 0, failed: 0, errors: [] };
+
+  for (const p of pledges || []) {
+    if (!p.invoiced_at || !p.stripe_session) { results.notDue++; continue; }
+
+    const age = days(p.invoiced_at);
+    const count = p.reminder_count || 0;
+
+    let which = 0;
+    if (count === 0 && age >= 7 && age < 30) which = 1;
+    else if (count === 1 && age >= 21 && age < 30) which = 2;
+
+    if (!which) {
+      if (count >= 2 || age >= 30) results.done++;
+      else results.notDue++;
+      continue;
+    }
+
+    // Reclamar antes de mandar, condicionado a que siga donde estaba.
+    const { data: mio, error: clErr } = await supabase
+      .from('game_pledges')
+      .update({ reminder_count: which, reminded_at: new Date().toISOString() })
+      .eq('id', p.id)
+      .eq('reminder_count', which - 1)
+      .select('id');
+
+    if (clErr) {
+      console.error(`Reclamar recordatorio de juego ${p.id}:`, clErr.message);
+      results.failed++;
+      results.errors.push(`${p.padrino_name}: ${clErr.message}`);
+      continue;
+    }
+    if (!mio || !mio.length) { results.notDue++; continue; }
+
+    try {
+      const raw = Number(p.rate) * Number(p.points || 0);
+      const topado = p.cap != null && Number(p.team_amount) < +raw.toFixed(2);
+
+      await sendGameEmail({
+        to: p.padrino_email,
+        name: p.padrino_name,
+        teamName, label,
+        points: Number(p.points || 0),
+        rate: Number(p.rate),
+        pledged: Number(p.team_amount),
+        platformAmount: Number(p.platform_amount),
+        amount: Number(p.amount),
+        cap: topado ? Number(p.cap) : null,
+        bruto: topado ? +raw.toFixed(2) : null,
+        payUrl: p.stripe_session,
+        reminder: which,
+      });
+
+      results.sent++;
+    } catch (e) {
+      console.error(`Game reminder failed for pledge ${p.id}:`, e.message);
+      try {
+        await supabase.from('game_pledges')
+          .update({ reminder_count: which - 1 })
+          .eq('id', p.id)
+          .eq('reminder_count', which);
+      } catch (e2) { console.error(`Devolver contador ${p.id}:`, e2.message); }
+      results.failed++;
+      results.errors.push(`${p.padrino_name}: ${e.message}`);
+    }
+  }
+
+  return results;
+}
+
 /* El barrido de recordatorios. Busca los retos que ya se cobraron y
    todavía tienen promesas sin pagar, y le pasa cada uno a
    recordarReto. El corte de treinta y un días es lo que evita que
@@ -1852,6 +2179,30 @@ async function barrerRecordatorios(forzado) {
       } catch (e) {
         console.error(`Barrido de recordatorios ${id}:`, e.message);
         hecho.push({ id, sent: 0, failed: 1, errors: [String(e.message || e)] });
+      }
+    }
+
+    /* Y los juegos de verdad. Misma ventana de treinta y un días: a
+       los treinta la promesa está cerrada, así que más atrás no hay
+       nada que recordar y la consulta no tiene por qué crecer. */
+    const { data: filasJ, error: errJ } = await supabase
+      .from('game_pledges')
+      .select('game_id')
+      .eq('invoice_status', 'sent')
+      .not('invoiced_at', 'is', null)
+      .gte('invoiced_at', desde);
+
+    if (errJ) throw errJ;
+
+    const juegos = [...new Set((filasJ || []).map(f => f.game_id).filter(Boolean))];
+
+    for (const id of juegos) {
+      try {
+        const out = await recordarJuego(id);
+        if (out.sent || out.failed) hecho.push(Object.assign({ juego: id }, out));
+      } catch (e) {
+        console.error(`Barrido de recordatorios, juego ${id}:`, e.message);
+        hecho.push({ juego: id, sent: 0, failed: 1, errors: [String(e.message || e)] });
       }
     }
   } finally {
@@ -1911,11 +2262,17 @@ app.post('/send-reminders', async (req, res) => {
   const admin = await requireAdmin(req);
   if (!admin.ok) return res.status(admin.code).json({ error: admin.error });
 
-  const { challenge_id } = req.body;
-  if (!challenge_id) return res.status(400).json({ error: 'challenge_id is required' });
+  /* Uno o el otro. Un reto del Fortress o un juego de verdad: son dos
+     tablas y el admin tiene que poder empujar las dos a mano. */
+  const { challenge_id, game_id } = req.body;
+  if (!challenge_id && !game_id) {
+    return res.status(400).json({ error: 'challenge_id or game_id is required' });
+  }
 
   try {
-    const results = await recordarReto(challenge_id);
+    const results = game_id
+      ? await recordarJuego(game_id)
+      : await recordarReto(challenge_id);
     if (results.error) return res.status(404).json({ error: results.error });
 
     console.log(`Challenge ${challenge_id} reminders —`, JSON.stringify(results));
