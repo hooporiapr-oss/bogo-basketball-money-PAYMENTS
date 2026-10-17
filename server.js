@@ -1570,7 +1570,22 @@ app.post('/challenge-sweep', async (req, res) => {
   try {
     const out = await barrerRetos();
     console.log(`Barrido a mano por ${quien} — ${out.challenges} reto(s)`);
-    return res.json(out);
+
+    /* Y los recordatorios en la misma llamada. Si este servicio se
+       duerme, el reloj de dentro se duerme con él y el único que
+       trabaja es el cron de fuera — que no tiene por qué saber que
+       aquí dentro hay dos relojes.
+       SIN forzar. La guardia de horas no es para proteger al que
+       llama: es para que a un padrino no le entre un correo de cobro a
+       las tres de la mañana. Un cron que pregunte cada cinco minutos
+       es tan rutinario como el reloj de dentro, y si se le deja
+       saltar la guardia, la guardia no sirve de nada. Lo único que la
+       salta es un humano pidiéndolo a mano en /send-reminders. */
+    let rec = null;
+    try { rec = await barrerRecordatorios(); }
+    catch (e) { console.error('Recordatorios en barrido a mano:', e.message); }
+
+    return res.json(Object.assign({}, out, { reminders: rec }));
   } catch (e) {
     console.error('Barrido:', e);
     return res.status(500).json({ error: String(e.message || e) });
@@ -1659,15 +1674,239 @@ app.post('/notify-application', async (req, res) => {
 
 
 // ══════════════════════════════════════════════════════
-//  REMINDERS
+//  RECORDATORIOS
 //
-//  Invoicing chased people for us. A link does not, so this does —
-//  once at seven days, once at twenty-one, and then never again.
-//  At thirty days the pledge closes and nothing more is asked.
+//  La factura perseguía a la gente por nosotros. Un enlace no, así que
+//  esto lo hace — uno a los siete días, uno a los veintiuno, y nunca
+//  más. A los treinta días la promesa se cierra y no se pide nada.
 //
-//  Admin presses a button. Automatic scheduling is a later problem;
-//  pressing this twice a month is not a burden.
+//  Esto lo decía antes el código: "que lo apriete el admin; ponerle
+//  horario es un problema para después". Dejó de serlo el día que la
+//  página empezó a prometerle a un programa que los recordatorios
+//  salen a los siete y a los veintiún días. Una promesa que depende de
+//  que alguien se acuerde de apretar un botón no es una promesa, así
+//  que ahora corre solo, con el mismo mecanismo que el cobro.
+//
+//  DOS COSAS QUE NO SE PUEDEN HACER MAL AQUÍ:
+//
+//  1. Mandar dos veces. A un padrino que ya recibió "éste es el
+//     último recordatorio" no se le puede escribir otra vez: deja de
+//     ser verdad lo que le dijimos. Así que el contador se RECLAMA
+//     antes de mandar, condicionado a que siga en el número de antes
+//     — igual que billed_at en el cobro. Dos ticks a la vez, dos
+//     instancias en Render, o un reinicio en medio: sólo uno pasa.
+//     Si el correo falla después de reclamar, se devuelve el contador
+//     a donde estaba y lo coge el tick siguiente.
+//
+//  2. Escribir a las tres de la mañana. Un correo de cobro a esa hora
+//     asusta. Se manda en horas decentes de Puerto Rico y punto.
 // ══════════════════════════════════════════════════════
+
+const RECORDAR_EVERY = 60 * 60 * 1000;   // cada hora; el día manda, no el minuto
+const HORA_DESDE = 9;                    // en Puerto Rico
+const HORA_HASTA = 20;
+let recordando = false;
+
+/* Puerto Rico es UTC-4 todo el año: no hay horario de verano que
+   corregir, así que esto no necesita librería. */
+function horaPR() {
+  return (new Date().getUTCHours() + 24 - 4) % 24;
+}
+function horaDecente() {
+  const h = horaPR();
+  return h >= HORA_DESDE && h < HORA_HASTA;
+}
+
+async function recordarReto(challenge_id) {
+  const { data: challenge } = await supabase
+    .from('challenges')
+    .select('name, campaign_id, campaigns(name)')
+    .eq('id', challenge_id)
+    .single();
+
+  if (!challenge) return { error: 'Challenge not found' };
+
+  const { data: pledges } = await supabase
+    .from('pledges')
+    .select('*, players(name)')
+    .eq('challenge_id', challenge_id)
+    .eq('invoice_status', 'sent');
+
+  const teamName = (challenge.campaigns && challenge.campaigns.name) || 'the program';
+  const now = Date.now();
+  const days = (iso) => (now - new Date(iso).getTime()) / 86400000;
+
+  const results = { sent: 0, notDue: 0, done: 0, failed: 0, errors: [] };
+
+  for (const p of pledges || []) {
+    if (!p.invoiced_at || !p.pay_link_url) { results.notDue++; continue; }
+
+    const age = days(p.invoiced_at);
+    const count = p.reminder_count || 0;
+
+    // Dos recordatorios, y sólo cuando de verdad toca.
+    let which = 0;
+    if (count === 0 && age >= 7 && age < 30) which = 1;
+    else if (count === 1 && age >= 21 && age < 30) which = 2;
+
+    if (!which) {
+      if (count >= 2 || age >= 30) results.done++;
+      else results.notDue++;
+      continue;
+    }
+
+    // La reclamación, ANTES de mandar. Si otro tick llegó primero, el
+    // contador ya no está en `which - 1` y este no manda nada.
+    const { data: mio, error: clErr } = await supabase
+      .from('pledges')
+      .update({ reminder_count: which, reminded_at: new Date().toISOString() })
+      .eq('id', p.id)
+      .eq('reminder_count', which - 1)
+      .select('id');
+
+    if (clErr) {
+      console.error(`Reclamar recordatorio ${p.id}:`, clErr.message);
+      results.failed++;
+      results.errors.push(`${p.sponsor_name}: ${clErr.message}`);
+      continue;
+    }
+    if (!mio || !mio.length) { results.notDue++; continue; }
+
+    try {
+      /* El tope, otra vez. El cobro se lo pasa al correo para que no
+         diga una multiplicación que no se hizo; el recordatorio no se
+         lo pasaba, así que a un padrino con tope le llegaba un
+         recordatorio con la cuenta mal. Se saca de lo que de verdad se
+         le cobró, no de una cuenta nueva. */
+      const bruto  = Number(p.rate_per_point) * (p.points_at_invoice || 0);
+      const topado = p.cap != null && Number(p.team_amount) < +bruto.toFixed(2);
+
+      await sendPledgeEmail({
+        to: p.sponsor_email,
+        name: p.sponsor_name,
+        who: p.player_id && p.players ? p.players.name : teamName,
+        points: p.points_at_invoice || 0,
+        teamName,
+        lang: p.lang === 'es' ? 'es' : 'en',
+        rate: Number(p.rate_per_point),
+        pledged: Number(p.team_amount),
+        platformAmount: Number(p.platform_amount),
+        amount: Number(p.amount),
+        cap: topado ? Number(p.cap) : null,
+        bruto: topado ? +bruto.toFixed(2) : null,
+        payUrl: p.pay_link_url.includes('pay.html')
+          ? p.pay_link_url
+          : `${PAY_BASE.school}/pay.html?p=${p.id}`,
+        reminder: which,
+      });
+
+      results.sent++;
+    } catch (e) {
+      console.error(`Reminder failed for pledge ${p.id}:`, e.message);
+      // Se devuelve el contador: mejor que lo reintente el tick
+      // siguiente que perder el recordatorio sin que nadie se entere.
+      try {
+        await supabase.from('pledges')
+          .update({ reminder_count: which - 1 })
+          .eq('id', p.id)
+          .eq('reminder_count', which);
+      } catch (e2) { console.error(`Devolver contador ${p.id}:`, e2.message); }
+      results.failed++;
+      results.errors.push(`${p.sponsor_name}: ${e.message}`);
+    }
+  }
+
+  return results;
+}
+
+/* El barrido de recordatorios. Busca los retos que ya se cobraron y
+   todavía tienen promesas sin pagar, y le pasa cada uno a
+   recordarReto. El corte de treinta y un días es lo que evita que
+   esto crezca para siempre: a los treinta la promesa está cerrada. */
+async function barrerRecordatorios(forzado) {
+  if (recordando) return { busy: true, challenges: 0, detail: [] };
+  if (!forzado && !horaDecente()) {
+    return { skipped: 'hora', hora_pr: horaPR(), challenges: 0, detail: [] };
+  }
+  recordando = true;
+
+  const hecho = [];
+  try {
+    const desde = new Date(Date.now() - 31 * 86400000).toISOString();
+
+    const { data: filas, error } = await supabase
+      .from('pledges')
+      .select('challenge_id')
+      .eq('invoice_status', 'sent')
+      .not('invoiced_at', 'is', null)
+      .gte('invoiced_at', desde);
+
+    if (error) throw error;
+
+    const retos = [...new Set((filas || []).map(f => f.challenge_id).filter(Boolean))];
+
+    for (const id of retos) {
+      try {
+        const out = await recordarReto(id);
+        if (out.sent || out.failed) hecho.push(Object.assign({ id }, out));
+      } catch (e) {
+        console.error(`Barrido de recordatorios ${id}:`, e.message);
+        hecho.push({ id, sent: 0, failed: 1, errors: [String(e.message || e)] });
+      }
+    }
+  } finally {
+    recordando = false;
+  }
+
+  if (hecho.length) {
+    console.log('Recordatorios —', JSON.stringify(hecho));
+    // Sólo se avisa cuando algo falló. Un correo diario diciendo que
+    // todo fue bien se deja de leer a la semana.
+    const malos = hecho.filter(h => h.failed);
+    if (malos.length) {
+      try { await avisoDeRecordatorios(malos); }
+      catch (e) { console.error('Aviso de recordatorios:', e.message); }
+    }
+  }
+  return { challenges: hecho.length, detail: hecho };
+}
+
+async function avisoDeRecordatorios(malos) {
+  const to = process.env.ADMIN_EMAIL || 'gostardigital@gmail.com';
+  const n = malos.reduce((a, h) => a + (h.failed || 0), 0);
+  const cuerpo =
+    `<p>No salieron ${n} recordatorio${n === 1 ? '' : 's'}.</p>` +
+    malos.map(h =>
+      `<p><b>${h.id}</b><br>` +
+      (h.errors || []).map(e => String(e)).join('<br>') + '</p>').join('') +
+    `<p>El contador se devolvió, así que el barrido siguiente lo reintenta. ` +
+    `Si vuelve a salir este aviso, es que algo está roto de verdad.</p>`;
+
+  if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
+
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: MAIL_FROM,
+      to: [to],
+      ...(MAIL_REPLY_TO ? { reply_to: MAIL_REPLY_TO } : {}),
+      subject: `Cada Punto — ${n} recordatorio${n === 1 ? '' : 's'} sin salir`,
+      html: cuerpo,
+      text: `No salieron ${n} recordatorios. ` +
+            malos.map(h => `${h.id}: ${(h.errors || []).join('; ')}`).join(' | '),
+    }),
+  });
+
+  if (!r.ok) {
+    const detail = await r.text().catch(() => '');
+    throw new Error(`Resend refused the notice (${r.status}): ${detail.slice(0, 200)}`);
+  }
+}
+
 app.post('/send-reminders', async (req, res) => {
   const admin = await requireAdmin(req);
   if (!admin.ok) return res.status(admin.code).json({ error: admin.error });
@@ -1676,72 +1915,8 @@ app.post('/send-reminders', async (req, res) => {
   if (!challenge_id) return res.status(400).json({ error: 'challenge_id is required' });
 
   try {
-    const { data: challenge } = await supabase
-      .from('challenges')
-      .select('name, campaign_id, campaigns(name)')
-      .eq('id', challenge_id)
-      .single();
-
-    if (!challenge) return res.status(404).json({ error: 'Challenge not found' });
-
-    const { data: pledges } = await supabase
-      .from('pledges')
-      .select('*, players(name)')
-      .eq('challenge_id', challenge_id)
-      .eq('invoice_status', 'sent');
-
-    const teamName = (challenge.campaigns && challenge.campaigns.name) || 'the program';
-    const now = Date.now();
-    const days = (iso) => (now - new Date(iso).getTime()) / 86400000;
-
-    const results = { sent: 0, notDue: 0, done: 0, failed: 0, errors: [] };
-
-    for (const p of pledges || []) {
-      if (!p.invoiced_at || !p.pay_link_url) { results.notDue++; continue; }
-
-      const age = days(p.invoiced_at);
-      const count = p.reminder_count || 0;
-
-      // Two reminders, and only when they are actually due.
-      let which = 0;
-      if (count === 0 && age >= 7 && age < 30) which = 1;
-      else if (count === 1 && age >= 21 && age < 30) which = 2;
-
-      if (!which) {
-        if (count >= 2 || age >= 30) results.done++;
-        else results.notDue++;
-        continue;
-      }
-
-      try {
-        await sendPledgeEmail({
-          to: p.sponsor_email,
-          name: p.sponsor_name,
-          who: p.player_id && p.players ? p.players.name : teamName,
-          points: p.points_at_invoice || 0,
-          teamName,
-          lang: p.lang === 'es' ? 'es' : 'en',
-          rate: Number(p.rate_per_point),
-          pledged: Number(p.team_amount),
-          platformAmount: Number(p.platform_amount),
-          amount: Number(p.amount),
-          payUrl: p.pay_link_url.includes('pay.html')
-            ? p.pay_link_url
-            : `${PAY_BASE.school}/pay.html?p=${p.id}`,
-          reminder: which,
-        });
-
-        await supabase.from('pledges')
-          .update({ reminder_count: which, reminded_at: new Date().toISOString() })
-          .eq('id', p.id);
-
-        results.sent++;
-      } catch (e) {
-        console.error(`Reminder failed for pledge ${p.id}:`, e.message);
-        results.failed++;
-        results.errors.push(`${p.sponsor_name}: ${e.message}`);
-      }
-    }
+    const results = await recordarReto(challenge_id);
+    if (results.error) return res.status(404).json({ error: results.error });
 
     console.log(`Challenge ${challenge_id} reminders —`, JSON.stringify(results));
     res.json(results);
@@ -2273,3 +2448,15 @@ setTimeout(() => {
 setInterval(() => {
   barrerRetos().catch(e => console.error('Barrido:', e.message));
 }, SWEEP_EVERY);
+
+// Los recordatorios, cada hora. No hace falta más fino: lo que decide
+// si toca o no es el DÍA de la promesa, no el minuto. La función se
+// salta ella misma las horas indecentes, así que de las veinticuatro
+// llamadas al día sólo trabajan las de horario de Puerto Rico.
+//
+// No hay barrido de arranque aquí, a propósito: un reinicio de Render
+// no es razón para escribirle a un padrino, y como muy tarde se coge
+// en la hora siguiente.
+setInterval(() => {
+  barrerRecordatorios().catch(e => console.error('Recordatorios:', e.message));
+}, RECORDAR_EVERY);
