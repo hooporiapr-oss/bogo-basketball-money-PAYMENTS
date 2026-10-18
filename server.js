@@ -1438,6 +1438,248 @@ app.post('/game-notices', async (req, res) => {
   }
 });
 
+/* ══════════════════════════════════════════════════════════════════
+   EL AVISO DEL PADRINO DE HOOPORIA — /challenge-notices
+
+   El hermano de /game-notices, para el otro producto. Las diferencias
+   no son de forma, son de modelo:
+
+   · Los puntos son de UN nene, no del equipo. El padrino prometió por
+     lo que anote su nieto, así que el correo lo nombra.
+   · No hay rival ni marcador: hay una ventana que puso el programa y
+     lo que el nene anotó dentro de ella.
+   · Va en UN idioma. game_pledges no guarda idioma y por eso el aviso
+     de Cada Punto apila español e inglés; 'pledges' sí lo guarda
+     —prometer.html manda p_lang— así que aquí se le escribe en el
+     idioma en que prometió. Si la fila no lo tiene (filas de antes de
+     que existiera la columna) salen los dos, que adivinar mal es peor.
+
+   ── La puerta: el código del entrenador, no una sesión de admin ───
+   /game-notices pide requireAdmin, y por eso no lo llama nada: la
+   sesión de admin sólo la tiene Gostar Digital, no el entrenador que
+   acaba de cerrar su evento. Aquí la puerta es el código del
+   entrenador, igual que en el reporte.
+
+   Y la comprobación no se escribe otra vez: se llama a
+   challenge_report, que YA comprueba el código, YA comprueba que la
+   campaña sea suya, y de paso devuelve la cuenta hecha. Si contesta
+   ok:false, no se manda nada.
+
+   ── Por qué el dinero no se calcula aquí ──────────────────────────
+   Porque el entrenador acaba de ver esas cifras en el reporte. Si
+   este correo las recalculara por su cuenta, bastaría una diferencia
+   —los cuartos sumados en un sitio y la corrida en el otro— para que
+   el padrino reciba un número que el entrenador no vio nunca. Una
+   sola cuenta, la del reporte.
+
+   ── Lo que este correo NO lleva, a propósito ──────────────────────
+   · enlace de pago — no procesamos pagos
+   · cargo de plataforma — la licencia la paga el programa, no él
+   · recordatorios — de éste no sale un segundo. Nunca.
+   · nada de deducible de impuestos. No lo somos y no lo decimos.
+   ══════════════════════════════════════════════════════════════════ */
+
+// El remitente de Hooporia. Por defecto dice Hooporia y no Cada Punto:
+// si cayera en MAIL_FROM, el aviso de un producto saldría firmado por
+// el otro hasta que alguien se acordara de poner la variable.
+const MAIL_FROM_HOOPORIA =
+  process.env.MAIL_FROM_HOOPORIA || 'Hooporia <onboarding@resend.dev>';
+
+function avisoRetoTextos(lang, o) {
+  const money = (n) => '$' + Number(n || 0).toFixed(2);
+
+  if (lang === 'es') {
+    const cuenta = o.cap != null
+      ? `Prometiste ${money(o.rate)} por punto, que habrían sido ${money(o.bruto)} — ` +
+        `pero pusiste un tope de ${money(o.cap)}, así que tu promesa es de <b>${money(o.pledged)}</b>.`
+      : `Prometiste ${money(o.rate)} por punto, así que tu promesa es de <b>${money(o.pledged)}</b>.`;
+    return {
+      subject: `${o.who} anotó ${o.points} puntos — tu promesa`,
+      lines: [
+        `Hola ${o.name},`,
+        `<b>${o.who}</b> anotó <b>${o.points} puntos</b> en ${o.retoName}.`,
+        cuenta,
+        `Ese dinero se lo pagas directamente a ${o.teamName}. Ellos te dirán cómo. ` +
+        `Hooporia no cobra pagos y no te va a escribir otra vez por esto.`,
+      ],
+    };
+  }
+
+  const cuenta = o.cap != null
+    ? `You pledged ${money(o.rate)} a point, which would have come to ${money(o.bruto)} — ` +
+      `but you set a ${money(o.cap)} cap, so your pledge is <b>${money(o.pledged)}</b>.`
+    : `You pledged ${money(o.rate)} a point, so your pledge comes to <b>${money(o.pledged)}</b>.`;
+  return {
+    subject: `${o.who} scored ${o.points} points — your pledge`,
+    lines: [
+      `Hi ${o.name},`,
+      `<b>${o.who}</b> scored <b>${o.points} points</b> in ${o.retoName}.`,
+      cuenta,
+      `You pay that directly to ${o.teamName}, who will tell you how. ` +
+      `Hooporia takes no payments and will not write to you about this again.`,
+    ],
+  };
+}
+
+async function sendChallengeNotice(o) {
+  // 'es' o 'en' explícitos. Cualquier otra cosa —null, una fila
+  // vieja— y salen los dos, porque no se sabe.
+  const idioma = (o.lang === 'es' || o.lang === 'en') ? o.lang : null;
+  const partes = idioma ? [avisoRetoTextos(idioma, o)]
+                        : [avisoRetoTextos('es', o), avisoRetoTextos('en', o)];
+
+  const bloque = (t) => t.lines.map(l => `<p>${l}</p>`).join('\n      ');
+  const html = `
+    <div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#12202E;font-size:15px;line-height:1.6">
+      ${partes.map(bloque).join(
+        '\n      <hr style="border:none;border-top:1px solid #D7E0E8;margin:22px 0">\n      ')}
+      <p style="color:#5A6B7C;font-size:.8rem;margin-top:22px">
+        Hooporia · Gostar Digital LLC · Puerto Rico
+      </p>
+    </div>`;
+
+  const text = partes
+    .map(t => t.lines.map(l => l.replace(/<[^>]+>/g, '')).join('\n'))
+    .join('\n\n---\n\n') + '\n';
+
+  if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
+
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: MAIL_FROM_HOOPORIA,
+      to: [o.to],
+      ...(MAIL_REPLY_TO ? { reply_to: MAIL_REPLY_TO } : {}),
+      subject: partes[0].subject,
+      html, text,
+    }),
+  });
+
+  if (!r.ok) {
+    const detail = await r.text().catch(() => '');
+    throw new Error(`Resend refused the notice (${r.status}): ${detail.slice(0, 200)}`);
+  }
+}
+
+app.post('/challenge-notices', async (req, res) => {
+  const { code, challenge_id } = req.body || {};
+  if (!code || !challenge_id) {
+    return res.status(400).json({ error: 'code and challenge_id are required' });
+  }
+
+  try {
+    // La puerta y la cuenta en la misma llamada. challenge_report
+    // comprueba el código con builder_check y que la campaña sea de
+    // ese entrenador; si cualquiera de las dos falla, contesta
+    // ok:false y aquí no se manda nada.
+    const { data: rep, error } = await supabase.rpc('challenge_report', {
+      p_code: String(code),
+      p_challenge: String(challenge_id),
+    });
+
+    if (error) {
+      console.error('challenge-notices report:', error.message);
+      return res.status(500).json({ error: 'report failed' });
+    }
+    if (!rep || rep.ok !== true) {
+      // El mismo mensaje que da el reporte, sin añadir nada: decir
+      // cuál de las dos cosas falló sería enumerar campañas ajenas.
+      return res.status(403).json({ error: (rep && rep.error) || 'not allowed' });
+    }
+
+    const teamName = rep.campaign || 'the program';
+    const retoName = (rep.challenge && rep.challenge.name) || teamName;
+    const out = { sent: 0, skipped: 0, zero: 0, failed: 0, errors: [] };
+
+    for (const p of rep.pledges || []) {
+      // Ya avisado, o cerrado por otra razón. Un padrino recibe este
+      // correo una vez.
+      if (p.estado !== 'open') { out.skipped++; continue; }
+
+      const total  = Number(p.total || 0);
+      const puntos = Number(p.puntos || 0);
+      const cents  = Math.round(total * 100);
+
+      /* Sin puntos no hay promesa que avisar, y por debajo de
+         cincuenta centavos no se le pide a nadie. Las dos filas se
+         cierran con su cifra guardada —no se dejan en 'open'
+         pareciendo pendientes para siempre— pero NO con 'void':
+         challenge_report esconde las anuladas, y esconder al nene que
+         no jugó es esconder el único problema que un reporte puede
+         enseñar. Con 'no_points' y 'too_small' siguen saliendo en el
+         reporte con su cero, que es la verdad. */
+      if (cents <= 0 || cents < 50) {
+        await supabase.from('pledges').update({
+          points_at_invoice: puntos,
+          team_amount: total,
+          amount: total,
+          platform_amount: 0,
+          invoice_status: cents <= 0 ? 'no_points' : 'too_small',
+        }).eq('id', p.id);
+        out.zero++;
+        continue;
+      }
+
+      /* La cuenta se guarda ANTES de mandar: si el correo falla, el
+         número ya está bueno y el aviso se puede repetir.
+
+         amount va igual que team_amount porque en este modelo no hay
+         recargo: el padrino paga la promesa y nada más. Dejar el
+         amount viejo ahí sería dejar escrito un número con el 10% de
+         un modelo que no existe. Y platform_amount a cero por lo
+         mismo: no hay cargo de plataforma que cobrarle a él. */
+      await supabase.from('pledges').update({
+        points_at_invoice: puntos,
+        team_amount: total,
+        amount: total,
+        platform_amount: 0,
+      }).eq('id', p.id);
+
+      try {
+        await sendChallengeNotice({
+          to: p.correo,
+          name: p.padrino,
+          who: p.jugador,
+          lang: p.idioma,
+          points: puntos,
+          teamName, retoName,
+          rate: Number(p.tarifa),
+          pledged: total,
+          // Para que el correo no cuente una multiplicación que no se
+          // hizo: el tope sólo se menciona si de verdad mordió.
+          cap:   p.tope != null && total < +(Number(p.tarifa) * puntos).toFixed(2)
+                   ? Number(p.tope) : null,
+          bruto: p.tope != null && total < +(Number(p.tarifa) * puntos).toFixed(2)
+                   ? +(Number(p.tarifa) * puntos).toFixed(2) : null,
+        });
+
+        // Sólo después de que el correo salió. 'sent' aquí quiere
+        // decir avisado, no facturado: no hay factura.
+        await supabase.from('pledges').update({
+          invoice_status: 'sent',
+          invoiced_at: new Date().toISOString(),
+        }).eq('id', p.id);
+        out.sent++;
+      } catch (e) {
+        // La fila se queda en 'open' con su cifra buena, así que se
+        // puede volver a pulsar el botón y sale sólo lo que faltó.
+        out.failed++;
+        out.errors.push(`${p.correo}: ${e.message}`);
+      }
+    }
+
+    console.log(`Challenge ${challenge_id} notices —`, JSON.stringify(out));
+    return res.json({ ok: true, campaign: teamName, challenge: retoName, ...out });
+  } catch (e) {
+    console.error('Challenge notices:', e.message);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/game-invoices', async (req, res) => {
   const admin = await requireAdmin(req);
   if (!admin) return res.status(403).json({ error: 'Not authorized' });
