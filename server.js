@@ -1499,8 +1499,12 @@ function avisoRetoTextos(lang, o) {
         `Hola ${o.name},`,
         `<b>${o.who}</b> anotó <b>${o.points} puntos</b> en ${o.retoName}.`,
         cuenta,
-        `Ese dinero se lo pagas directamente a ${o.teamName}. Ellos te dirán cómo. ` +
-        `Hooporia no cobra pagos y no te va a escribir otra vez por esto.`,
+        o.contactEmail
+          ? `Ese dinero se lo pagas directamente a ${o.teamName}. Si no sabes cómo, ` +
+            `escríbele a ${o.contactName || o.teamName}: ${o.contactEmail}. ` +
+            `Es quien lo recibe. Hooporia no cobra pagos y no te va a escribir otra vez por esto.`
+          : `Ese dinero se lo pagas directamente a ${o.teamName}. Ellos te dirán cómo. ` +
+            `Hooporia no cobra pagos y no te va a escribir otra vez por esto.`,
       ],
     };
   }
@@ -1515,8 +1519,12 @@ function avisoRetoTextos(lang, o) {
       `Hi ${o.name},`,
       `<b>${o.who}</b> scored <b>${o.points} points</b> in ${o.retoName}.`,
       cuenta,
-      `You pay that directly to ${o.teamName}, who will tell you how. ` +
-      `Hooporia takes no payments and will not write to you about this again.`,
+      o.contactEmail
+        ? `You pay that directly to ${o.teamName}. If you are not sure how, write to ` +
+          `${o.contactName || o.teamName}: ${o.contactEmail}. They are the one who ` +
+          `receives it. Hooporia takes no payments and will not write to you about this again.`
+        : `You pay that directly to ${o.teamName}, who will tell you how. ` +
+          `Hooporia takes no payments and will not write to you about this again.`,
     ],
   };
 }
@@ -1553,7 +1561,17 @@ async function sendChallengeNotice(o) {
     body: JSON.stringify({
       from: MAIL_FROM_HOOPORIA,
       to: [o.to],
-      ...(MAIL_REPLY_TO ? { reply_to: MAIL_REPLY_TO } : {}),
+      /* El reply_to va al entrenador que mandó los avisos, no al
+         nuestro. Un padrino que le dé a Responder preguntando cómo
+         paga tiene que llegarle a quien cobra; si llega a Gostar
+         Digital, llega a alguien que no tiene su dinero ni cómo
+         ayudarle, y encima parece que lo cobramos nosotros.
+
+         Sin contacto cae en MAIL_REPLY_TO, y si eso también está
+         vacío no va reply_to ninguno — mejor eso que mandarle a un
+         buzón que nadie lee. */
+      ...(o.contactEmail ? { reply_to: o.contactEmail }
+                         : (MAIL_REPLY_TO ? { reply_to: MAIL_REPLY_TO } : {})),
       subject: partes[0].subject,
       html, text,
     }),
@@ -1593,6 +1611,13 @@ app.post('/challenge-notices', async (req, res) => {
 
     const teamName = rep.campaign || 'the program';
     const retoName = (rep.challenge && rep.challenge.name) || teamName;
+
+    /* A quién le escribe un padrino que no sabe cómo pagar: el
+       entrenador dueño del código que acaba de mandar los avisos, que
+       el reporte saca de coaches. Puede venir vacío —con un
+       admin_code no hay fila— y entonces el correo vuelve a decir
+       sólo «el programa te dirá cómo». */
+    const contacto = rep.contact || {};
     const out = { sent: 0, skipped: 0, zero: 0, failed: 0, errors: [] };
 
     for (const p of rep.pledges || []) {
@@ -1647,6 +1672,8 @@ app.post('/challenge-notices', async (req, res) => {
           lang: p.idioma,
           points: puntos,
           teamName, retoName,
+          contactName: contacto.name || null,
+          contactEmail: contacto.email || null,
           rate: Number(p.tarifa),
           pledged: total,
           // Para que el correo no cuente una multiplicación que no se
