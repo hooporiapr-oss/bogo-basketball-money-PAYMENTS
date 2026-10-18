@@ -782,6 +782,13 @@ async function guardarEstado(campaign_id, acct) {
 }
 
 // ── Empezar o retomar el alta ─────────────────────────
+/* CERRADA — no hay Stripe Connect
+   Cada Punto es un sistema de manejo de promesas: no procesa pagos y
+   no le escribe a ningún padrino. Esta ruta se deja en el fichero
+   para no romper nada que todavía la llame, pero no hace nada. */
+app.post('/connect/start', (req, res) =>
+  res.status(410).json({ error: 'gone', why: 'no hay Stripe Connect' }));
+
 app.post('/connect/start', async (req, res) => {
   try {
     const { code, campaign_id } = req.body || {};
@@ -850,6 +857,13 @@ app.post('/connect/start', async (req, res) => {
 });
 
 // ── Releer el estado desde Stripe ─────────────────────
+/* CERRADA — no hay Stripe Connect
+   Cada Punto es un sistema de manejo de promesas: no procesa pagos y
+   no le escribe a ningún padrino. Esta ruta se deja en el fichero
+   para no romper nada que todavía la llame, pero no hace nada. */
+app.post('/connect/status', (req, res) =>
+  res.status(410).json({ error: 'gone', why: 'no hay Stripe Connect' }));
+
 app.post('/connect/status', async (req, res) => {
   try {
     const { code, campaign_id } = req.body || {};
@@ -877,6 +891,13 @@ app.post('/connect/status', async (req, res) => {
   }
 });
 
+
+/* CERRADA — no procesamos pagos
+   Cada Punto es un sistema de manejo de promesas: no procesa pagos y
+   no le escribe a ningún padrino. Esta ruta se deja en el fichero
+   para no romper nada que todavía la llame, pero no hace nada. */
+app.post('/pay-pledge', (req, res) =>
+  res.status(410).json({ error: 'gone', why: 'no procesamos pagos' }));
 
 app.post('/pay-pledge', async (req, res) => {
   try {
@@ -1078,7 +1099,7 @@ app.post('/score-posted', async (req, res) => {
     const html = `
       <div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#12202E">
         <p style="font-size:.72rem;font-weight:800;letter-spacing:.18em;text-transform:uppercase;color:#0B7A5A;margin:0 0 6px">
-          Listo para cobrar
+          Lista de promesas lista
         </p>
         <h1 style="font-size:1.35rem;margin:0 0 4px">${team} ${label}</h1>
         <p style="margin:0 0 16px;color:#5A6B7C">
@@ -1087,14 +1108,14 @@ app.post('/score-posted', async (req, res) => {
         </p>
 
         <table style="width:100%;border-collapse:collapse;font-size:.95rem">
-          <tr><td style="padding:7px 0;border-bottom:1px solid #D7E0E8">Promesas sin cobrar</td>
+          <tr><td style="padding:7px 0;border-bottom:1px solid #D7E0E8">Promesas en este juego</td>
               <td style="padding:7px 0;border-bottom:1px solid #D7E0E8;text-align:right"><b>${open.length}</b></td></tr>
-          <tr><td style="padding:7px 0">Para el programa</td>
+          <tr><td style="padding:7px 0">Prometido al programa</td>
               <td style="padding:7px 0;text-align:right"><b>$${due.toFixed(2)}</b></td></tr>
         </table>
 
         <p style="margin:18px 0 0;color:#5A6B7C;font-size:.9rem">
-          Manda los enlaces de pago desde el admin.
+          La lista está en el admin, para imprimir o bajar. El cobro lo hace el programa.
         </p>
         <p style="color:#5A6B7C;font-size:.8rem;margin-top:20px">
           Gostar Digital LLC · Puerto Rico
@@ -1104,8 +1125,8 @@ app.post('/score-posted', async (req, res) => {
     const text =
       `${team} ${label} — ${game.plays_on || ''}\n` +
       `Final: ${game.team_points}${game.opp_points != null ? ' – ' + game.opp_points : ''}\n\n` +
-      `${open.length} promesa(s) sin cobrar · $${due.toFixed(2)} para el programa.\n` +
-      `Manda los enlaces de pago desde el admin.\n`;
+      `${open.length} promesa(s) · $${due.toFixed(2)} prometidos al programa.\n` +
+      `La lista esta en el admin, para imprimir o bajar. El cobro lo hace el programa.\n`;
 
     if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
 
@@ -1119,7 +1140,7 @@ app.post('/score-posted', async (req, res) => {
         from: MAIL_FROM,
         to: [to],
         ...(MAIL_REPLY_TO ? { reply_to: MAIL_REPLY_TO } : {}),
-        subject: `Listo para cobrar: ${team} ${label}`,
+        subject: `Lista de promesas: ${team} ${label}`,
         html, text,
       }),
     });
@@ -1138,7 +1159,7 @@ app.post('/score-posted', async (req, res) => {
 });
 
 app.post('/team-signup', async (req, res) => {
-  const { team, program, coach, email, phone } = req.body || {};
+  const { team, program, coach, email, phone, license } = req.body || {};
 
   if (!team || !email) {
     return res.status(400).json({ error: 'team and email are required' });
@@ -1163,6 +1184,22 @@ app.post('/team-signup', async (req, res) => {
         ${row('Correo', `<a href="mailto:${email}">${email}</a>`)}
         ${row('Teléfono', phone)}
       </table>
+
+      ${license && license.accepted ? `
+      <div style="margin:18px 0 0;padding:14px 16px;border:1px solid #D7E0E8;border-left:4px solid #FF7A18;border-radius:8px">
+        <p style="margin:0 0 6px;font-size:.68rem;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:#FF7A18">
+          Licencia aceptada
+        </p>
+        <p style="margin:0 0 8px;font-size:.9rem">
+          <b>${license.by || coach || '—'}</b> · ${license.at || '—'}
+        </p>
+        <p style="margin:0;color:#5A6B7C;font-size:.82rem;line-height:1.5">
+          ${String(license.terms || '').replace(/<[^>]*>/g, '')}
+        </p>
+      </div>` : `
+      <p style="margin:18px 0 0;color:#A8323F;font-size:.9rem">
+        Sin acuse de licencia en esta solicitud.
+      </p>`}
       <p style="margin:18px 0 0;color:#5A6B7C;font-size:.9rem">
         Aprueba o rechaza desde el admin — la petición ya está en la cola.
       </p>
@@ -1178,6 +1215,10 @@ app.post('/team-signup', async (req, res) => {
     `Coach:    ${coach || '—'}\n` +
     `Correo:   ${email}\n` +
     `Teléfono: ${phone || '—'}\n\n` +
+    (license && license.accepted
+      ? `Licencia aceptada por ${license.by || coach || '—'} el ${license.at || '—'}\n` +
+        `${String(license.terms || '').replace(/<[^>]*>/g, '')}\n\n`
+      : `SIN acuse de licencia en esta solicitud.\n\n`) +
     `Aprueba desde el admin.\n`;
 
   try {
@@ -1208,6 +1249,192 @@ app.post('/team-signup', async (req, res) => {
     // El aviso es un extra: que falle no puede romper la inscripción.
     console.error('Team signup notice:', e.message);
     return res.json({ ok: false, note: 'request saved, notice failed' });
+  }
+});
+
+/* CERRADA — no mandamos cobros a padrinos
+   Cada Punto es un sistema de manejo de promesas: no procesa pagos y
+   no le escribe a ningún padrino. Esta ruta se deja en el fichero
+   para no romper nada que todavía la llame, pero no hace nada. */
+app.post('/game-invoices', (req, res) =>
+  res.status(410).json({ error: 'gone', why: 'no mandamos cobros a padrinos' }));
+
+/* ══════════════════════════════════════════════════════════════════
+   EL AVISO DEL PADRINO — /game-notices
+
+   Lo que sustituye al cobro. Cuando entra el marcador, cada padrino
+   recibe UN correo: el resultado, su tarifa, su tope si mordió, y lo
+   que dio su promesa. Nada más.
+
+   Lo que este correo NO lleva, a propósito:
+   · enlace de pago — no procesamos pagos
+   · cargo de plataforma — la licencia la paga el programa, no él
+   · recordatorios — de éste no sale un segundo. Nunca.
+
+   Quién cobra se dice en el propio correo, porque si no el padrino
+   nos escribe a nosotros, y nosotros no tenemos nada que cobrarle.
+
+   El correo va en español con el inglés debajo: la fila de promesa no
+   guarda idioma, y adivinar mal es peor que poner los dos.
+   ══════════════════════════════════════════════════════════════════ */
+async function sendGameNotice(o) {
+  const money = n => `$${Number(n).toFixed(2)}`;
+  const marcador = `${o.points}${o.opp != null ? ' – ' + o.opp : ''}`;
+
+  const cuentaEs = o.cap
+    ? `Prometiste ${money(o.rate)} por punto, que habrían sido ${money(o.bruto)} —
+       pero pusiste un tope de ${money(o.cap)}, así que tu promesa es de
+       <b>${money(o.pledged)}</b>.`
+    : `Prometiste ${money(o.rate)} por punto, así que tu promesa es de
+       <b>${money(o.pledged)}</b>.`;
+
+  const cuentaEn = o.cap
+    ? `You pledged ${money(o.rate)} a point, which would have come to ${money(o.bruto)} —
+       but you set a ${money(o.cap)} cap, so your pledge is <b>${money(o.pledged)}</b>.`
+    : `You pledged ${money(o.rate)} a point, so your pledge comes to
+       <b>${money(o.pledged)}</b>.`;
+
+  const html = `
+    <div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#12202E;font-size:15px;line-height:1.6">
+      <p>Hola ${o.name},</p>
+      <p>${o.teamName} jugó ${o.label} y anotó <b>${o.points} puntos</b>${
+        o.opp != null ? ` (${marcador})` : ''}.</p>
+      <p>${cuentaEs}</p>
+      <p>Ese dinero se lo pagas directamente a ${o.teamName}. Ellos te dirán cómo.
+         Cada Punto no cobra pagos y no te va a escribir otra vez por esto.</p>
+      <hr style="border:none;border-top:1px solid #D7E0E8;margin:22px 0">
+      <p>Hi ${o.name},</p>
+      <p>${o.teamName} played ${o.label} and scored <b>${o.points} points</b>.</p>
+      <p>${cuentaEn}</p>
+      <p>You pay that directly to ${o.teamName}, who will tell you how.
+         Cada Punto takes no payments and will not write to you about this again.</p>
+      <p style="color:#5A6B7C;font-size:.8rem;margin-top:22px">
+        Cada Punto Cuenta · Gostar Digital LLC · Puerto Rico
+      </p>
+    </div>`;
+
+  const text =
+    `${o.teamName} ${o.label} — ${o.points} puntos\n\n` +
+    (o.cap
+      ? `Prometiste ${money(o.rate)} por punto (habrian sido ${money(o.bruto)}); con tu tope de ${money(o.cap)}, tu promesa es ${money(o.pledged)}.\n`
+      : `Prometiste ${money(o.rate)} por punto, asi que tu promesa es ${money(o.pledged)}.\n`) +
+    `Le pagas directamente a ${o.teamName}. Cada Punto no cobra pagos.\n`;
+
+  if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
+
+  const r = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: MAIL_FROM,
+      to: [o.to],
+      ...(MAIL_REPLY_TO ? { reply_to: MAIL_REPLY_TO } : {}),
+      subject: `${o.teamName} ${o.label} — ${o.points} puntos`,
+      html, text,
+    }),
+  });
+
+  if (!r.ok) {
+    const detail = await r.text().catch(() => '');
+    throw new Error(`Resend refused the notice (${r.status}): ${detail.slice(0, 200)}`);
+  }
+}
+
+app.post('/game-notices', async (req, res) => {
+  const admin = await requireAdmin(req);
+  if (!admin) return res.status(403).json({ error: 'Not authorized' });
+
+  const { game_id } = req.body || {};
+  if (!game_id) return res.status(400).json({ error: 'game_id is required' });
+
+  try {
+    const { data: game, error: gErr } = await supabase
+      .from('games')
+      .select('id, opponent, plays_on, home, team_points, opp_points, status, campaign_id, campaigns(name)')
+      .eq('id', game_id)
+      .single();
+
+    if (gErr || !game) return res.status(404).json({ error: 'Game not found' });
+    if (game.status !== 'played') {
+      return res.status(400).json({ error: 'Enter the score first' });
+    }
+
+    const points = Number(game.team_points || 0);
+    const teamName = (game.campaigns && game.campaigns.name) || 'the program';
+    const label = `${game.home ? 'vs' : '@'} ${game.opponent}`;
+
+    const { data: pledges } = await supabase
+      .from('game_pledges')
+      .select('*')
+      .eq('game_id', game_id);
+
+    const out = { sent: 0, skipped: 0, zero: 0, failed: 0, errors: [] };
+
+    for (const p of pledges || []) {
+      if (p.invoice_status !== 'open') { out.skipped++; continue; }
+
+      // Sin puntos no hay promesa que avisar. Se cierra, no se deja
+      // colgando para siempre.
+      if (points <= 0) {
+        await supabase.from('game_pledges')
+          .update({ points: 0, amount: 0, team_amount: 0, invoice_status: 'void' })
+          .eq('id', p.id);
+        out.zero++;
+        continue;
+      }
+
+      // El tope lo puso el padrino, y manda.
+      const raw = Number(p.rate) * points;
+      const pledged = +(p.cap != null ? Math.min(raw, Number(p.cap)) : raw).toFixed(2);
+
+      // Menos de cincuenta centavos no se le pide a nadie.
+      if (Math.round(pledged * 100) < 50) {
+        await supabase.from('game_pledges')
+          .update({ points, amount: pledged, team_amount: pledged, invoice_status: 'void' })
+          .eq('id', p.id);
+        out.zero++;
+        continue;
+      }
+
+      // La cuenta se guarda ANTES de mandar: si el correo falla, el
+      // numero ya esta bueno y el aviso se puede repetir a mano.
+      await supabase.from('game_pledges')
+        .update({ points, amount: pledged, team_amount: pledged })
+        .eq('id', p.id);
+
+      const topado = p.cap != null && pledged < +raw.toFixed(2);
+
+      try {
+        await sendGameNotice({
+          to: p.padrino_email,
+          name: p.padrino_name,
+          teamName, label, points,
+          opp: game.opp_points != null ? Number(game.opp_points) : null,
+          rate: Number(p.rate),
+          pledged,
+          cap: topado ? Number(p.cap) : null,
+          bruto: topado ? +raw.toFixed(2) : null,
+        });
+
+        // Solo despues de que el correo salio. 'sent' aqui quiere
+        // decir avisado, no facturado: no hay factura.
+        await supabase.from('game_pledges')
+          .update({ invoice_status: 'sent', invoiced_at: new Date().toISOString() })
+          .eq('id', p.id);
+        out.sent++;
+      } catch (e) {
+        out.failed++;
+        out.errors.push(`${p.padrino_email}: ${e.message}`);
+      }
+    }
+
+    return res.json({ ok: true, points, ...out });
+  } catch (e) {
+    console.error('Game notices:', e.message);
+    return res.status(500).json({ error: e.message });
   }
 });
 
@@ -1602,6 +1829,13 @@ async function cobrarReto(challenge_id) {
   }
 }
 
+/* CERRADA — no mandamos cobros a padrinos
+   Cada Punto es un sistema de manejo de promesas: no procesa pagos y
+   no le escribe a ningún padrino. Esta ruta se deja en el fichero
+   para no romper nada que todavía la llame, pero no hace nada. */
+app.post('/challenge-invoices', (req, res) =>
+  res.status(410).json({ error: 'gone', why: 'no mandamos cobros a padrinos' }));
+
 app.post('/challenge-invoices', async (req, res) => {
   const admin = await requireAdmin(req);
   if (!admin) return res.status(403).json({ error: 'Not authorized' });
@@ -1776,6 +2010,13 @@ async function avisoDeBarrido(reto, out) {
 // Forzar el barrido desde fuera. Dos llaves lo abren: la SWEEP_KEY
 // (para un cron de verdad, que no tiene con qué firmar como usuario)
 // o el token de un admin.
+/* CERRADA — no hay barrido que cobre
+   Cada Punto es un sistema de manejo de promesas: no procesa pagos y
+   no le escribe a ningún padrino. Esta ruta se deja en el fichero
+   para no romper nada que todavía la llame, pero no hace nada. */
+app.post('/challenge-sweep', (req, res) =>
+  res.status(410).json({ error: 'gone', why: 'no hay barrido que cobre' }));
+
 app.post('/challenge-sweep', async (req, res) => {
   let quien = null;
 
@@ -2257,6 +2498,13 @@ async function avisoDeRecordatorios(malos) {
     throw new Error(`Resend refused the notice (${r.status}): ${detail.slice(0, 200)}`);
   }
 }
+
+/* CERRADA — no mandamos recordatorios de cobro
+   Cada Punto es un sistema de manejo de promesas: no procesa pagos y
+   no le escribe a ningún padrino. Esta ruta se deja en el fichero
+   para no romper nada que todavía la llame, pero no hace nada. */
+app.post('/send-reminders', (req, res) =>
+  res.status(410).json({ error: 'gone', why: 'no mandamos recordatorios de cobro' }));
 
 app.post('/send-reminders', async (req, res) => {
   const admin = await requireAdmin(req);
@@ -2790,30 +3038,19 @@ function randToken() {
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Payment server listening on ${port}`));
 
-// El barrido cada cinco minutos, y uno al arrancar: si Render reinició
-// el servicio justo cuando se cerraba una ventana, el tick siguiente
-// podría tardar, y el de arranque lo coge. Treinta segundos de margen
-// para que el servicio esté entero antes de cobrarle a nadie.
-//
-// Si este servicio se duerme (plan gratis), el reloj se duerme con él.
-// Entonces hace falta que algo de fuera le llame a /challenge-sweep
-// con la SWEEP_KEY, o simplemente a / para despertarlo.
-setTimeout(() => {
-  barrerRetos().catch(e => console.error('Barrido de arranque:', e.message));
-}, 30 * 1000);
+/* ══════════════════════════════════════════════════════════════════
+   LOS RELOJES, APAGADOS — 17 de octubre de 2026
 
-setInterval(() => {
-  barrerRetos().catch(e => console.error('Barrido:', e.message));
-}, SWEEP_EVERY);
+   Cada Punto dejó de ser custodial. No procesamos pagos, no cobramos
+   y no le escribimos a ningún padrino, así que no hay nada que un
+   reloj tenga que disparar: ni el barrido de retos (que cerraba la
+   ventana y mandaba los cobros), ni el de recordatorios (que escribía
+   a los siete y a los veintiún días).
 
-// Los recordatorios, cada hora. No hace falta más fino: lo que decide
-// si toca o no es el DÍA de la promesa, no el minuto. La función se
-// salta ella misma las horas indecentes, así que de las veinticuatro
-// llamadas al día sólo trabajan las de horario de Puerto Rico.
-//
-// No hay barrido de arranque aquí, a propósito: un reinicio de Render
-// no es razón para escribirle a un padrino, y como muy tarde se coge
-// en la hora siguiente.
-setInterval(() => {
-  barrerRecordatorios().catch(e => console.error('Recordatorios:', e.message));
-}, RECORDAR_EVERY);
+   Se dejan apagados y no borrados a propósito: el cálculo que hay
+   dentro de barrerRetos — cerrar el reto y sacar lo que prometió cada
+   padrino — sigue siendo el bueno. Lo que se quita es el envío.
+
+   Si algún día vuelve a hacer falta un reloj, será para calcular, no
+   para cobrar, y entonces se enciende lo que haga falta a sabiendas.
+   ══════════════════════════════════════════════════════════════════ */
