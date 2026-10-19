@@ -1621,9 +1621,21 @@ app.post('/challenge-notices', async (req, res) => {
     const out = { sent: 0, skipped: 0, zero: 0, failed: 0, errors: [] };
 
     for (const p of rep.pledges || []) {
-      // Ya avisado, o cerrado por otra razón. Un padrino recibe este
-      // correo una vez.
-      if (p.estado !== 'open') { out.skipped++; continue; }
+      /* Quién sigue sin avisar. Es una lista blanca a propósito, y
+         costó una corrida de prueba averiguar por qué hacía falta:
+         cp_pledge crea las promesas con invoice_status 'pending', no
+         'open'. Pidiendo 'open' a secas, el botón contestaba
+         «1 saltada» y no mandaba nada — y el entrenador se habría ido
+         a buscar el fallo a Resend, que no tenía ninguno.
+
+         Lista blanca y no lista negra porque el error de cada lado no
+         es el mismo: si aparece un estado nuevo y no está aquí, el
+         padrino no recibe su aviso y el entrenador lo ve en la cuenta
+         de «saltadas»; al revés, un estado nuevo que debiera callar
+         acabaría en el buzón de una abuela por segunda vez, y eso no
+         se puede retirar. */
+      const SIN_AVISAR = [null, undefined, '', 'open', 'pending'];
+      if (SIN_AVISAR.indexOf(p.estado) === -1) { out.skipped++; continue; }
 
       const total  = Number(p.total || 0);
       const puntos = Number(p.puntos || 0);
