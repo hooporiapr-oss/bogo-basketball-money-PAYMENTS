@@ -170,30 +170,6 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
   // Kept for any invoice still outstanding from before links.
   if (event.type === 'invoice.paid') {
     const inv = event.data.object;
-
-    /* La licencia de un evento se mira primero, y si era una se
-       acaba aquí. Es el único cobro que Hooporia hace, y comparte
-       el tipo de evento con las facturas viejas de padrinos: sin
-       esto, una licencia pagada pasaría por el UPDATE de pledges,
-       no encontraría ninguna fila, y el webhook diría que todo fue
-       bien mientras la licencia se queda marcada como enviada para
-       siempre. */
-    try {
-      const { data: lic } = await supabase
-        .from('licencias')
-        .update({ estado: 'pagada', paid_at: new Date().toISOString() })
-        .eq('stripe_invoice_id', inv.id)
-        .neq('estado', 'anulada')
-        .select('id');
-      if (lic && lic.length) {
-        console.log(`Licencia ${lic[0].id} pagada (${inv.id})`);
-        return res.status(200).send('ok');
-      }
-    } catch (e) {
-      console.error('No pude marcar la licencia pagada:', e);
-      return res.status(500).send('Failed to record licence payment');
-    }
-
     try {
       await supabase
         .from('pledges')
@@ -1462,287 +1438,6 @@ app.post('/game-notices', async (req, res) => {
   }
 });
 
-/* ══════════════════════════════════════════════════════════════════
-   EL AVISO DEL PADRINO DE HOOPORIA — /challenge-notices
-
-   El hermano de /game-notices, para el otro producto. Las diferencias
-   no son de forma, son de modelo:
-
-   · Los puntos son de UN nene, no del equipo. El padrino prometió por
-     lo que anote su nieto, así que el correo lo nombra.
-   · No hay rival ni marcador: hay una ventana que puso el programa y
-     lo que el nene anotó dentro de ella.
-   · Va en UN idioma. game_pledges no guarda idioma y por eso el aviso
-     de Cada Punto apila español e inglés; 'pledges' sí lo guarda
-     —prometer.html manda p_lang— así que aquí se le escribe en el
-     idioma en que prometió. Si la fila no lo tiene (filas de antes de
-     que existiera la columna) salen los dos, que adivinar mal es peor.
-
-   ── La puerta: el código del entrenador, no una sesión de admin ───
-   /game-notices pide requireAdmin, y por eso no lo llama nada: la
-   sesión de admin sólo la tiene Gostar Digital, no el entrenador que
-   acaba de cerrar su evento. Aquí la puerta es el código del
-   entrenador, igual que en el reporte.
-
-   Y la comprobación no se escribe otra vez: se llama a
-   challenge_report, que YA comprueba el código, YA comprueba que la
-   campaña sea suya, y de paso devuelve la cuenta hecha. Si contesta
-   ok:false, no se manda nada.
-
-   ── Por qué el dinero no se calcula aquí ──────────────────────────
-   Porque el entrenador acaba de ver esas cifras en el reporte. Si
-   este correo las recalculara por su cuenta, bastaría una diferencia
-   —los cuartos sumados en un sitio y la corrida en el otro— para que
-   el padrino reciba un número que el entrenador no vio nunca. Una
-   sola cuenta, la del reporte.
-
-   ── Lo que este correo NO lleva, a propósito ──────────────────────
-   · enlace de pago — no procesamos pagos
-   · cargo de plataforma — la licencia la paga el programa, no él
-   · recordatorios — de éste no sale un segundo. Nunca.
-   · nada de deducible de impuestos. No lo somos y no lo decimos.
-   ══════════════════════════════════════════════════════════════════ */
-
-// El remitente de Hooporia. Por defecto dice Hooporia y no Cada Punto:
-// si cayera en MAIL_FROM, el aviso de un producto saldría firmado por
-// el otro hasta que alguien se acordara de poner la variable.
-const MAIL_FROM_HOOPORIA =
-  process.env.MAIL_FROM_HOOPORIA || 'Hooporia <onboarding@resend.dev>';
-
-function avisoRetoTextos(lang, o) {
-  const money = (n) => '$' + Number(n || 0).toFixed(2);
-
-  if (lang === 'es') {
-    const cuenta = o.cap != null
-      ? `Prometiste ${money(o.rate)} por punto, que habrían sido ${money(o.bruto)} — ` +
-        `pero pusiste un tope de ${money(o.cap)}, así que tu promesa es de <b>${money(o.pledged)}</b>.`
-      : `Prometiste ${money(o.rate)} por punto, así que tu promesa es de <b>${money(o.pledged)}</b>.`;
-    return {
-      subject: `${o.who} anotó ${o.points} puntos — tu promesa`,
-      lines: [
-        `Hola ${o.name},`,
-        `<b>${o.who}</b> anotó <b>${o.points} puntos</b> en ${o.retoName}.`,
-        cuenta,
-        o.contactEmail
-          ? `Ese dinero se lo pagas directamente a ${o.teamName}. Si no sabes cómo, ` +
-            `escríbele a ${o.contactName || o.teamName}: ${o.contactEmail}. ` +
-            `Es quien lo recibe. Hooporia no cobra pagos y no te va a escribir otra vez por esto.`
-          : `Ese dinero se lo pagas directamente a ${o.teamName}. Ellos te dirán cómo. ` +
-            `Hooporia no cobra pagos y no te va a escribir otra vez por esto.`,
-      ],
-    };
-  }
-
-  const cuenta = o.cap != null
-    ? `You pledged ${money(o.rate)} a point, which would have come to ${money(o.bruto)} — ` +
-      `but you set a ${money(o.cap)} cap, so your pledge is <b>${money(o.pledged)}</b>.`
-    : `You pledged ${money(o.rate)} a point, so your pledge comes to <b>${money(o.pledged)}</b>.`;
-  return {
-    subject: `${o.who} scored ${o.points} points — your pledge`,
-    lines: [
-      `Hi ${o.name},`,
-      `<b>${o.who}</b> scored <b>${o.points} points</b> in ${o.retoName}.`,
-      cuenta,
-      o.contactEmail
-        ? `You pay that directly to ${o.teamName}. If you are not sure how, write to ` +
-          `${o.contactName || o.teamName}: ${o.contactEmail}. They are the one who ` +
-          `receives it. Hooporia takes no payments and will not write to you about this again.`
-        : `You pay that directly to ${o.teamName}, who will tell you how. ` +
-          `Hooporia takes no payments and will not write to you about this again.`,
-    ],
-  };
-}
-
-async function sendChallengeNotice(o) {
-  // 'es' o 'en' explícitos. Cualquier otra cosa —null, una fila
-  // vieja— y salen los dos, porque no se sabe.
-  const idioma = (o.lang === 'es' || o.lang === 'en') ? o.lang : null;
-  const partes = idioma ? [avisoRetoTextos(idioma, o)]
-                        : [avisoRetoTextos('es', o), avisoRetoTextos('en', o)];
-
-  const bloque = (t) => t.lines.map(l => `<p>${l}</p>`).join('\n      ');
-  const html = `
-    <div style="font-family:Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;color:#12202E;font-size:15px;line-height:1.6">
-      ${partes.map(bloque).join(
-        '\n      <hr style="border:none;border-top:1px solid #D7E0E8;margin:22px 0">\n      ')}
-      <p style="color:#5A6B7C;font-size:.8rem;margin-top:22px">
-        Hooporia · Gostar Digital LLC · Puerto Rico
-      </p>
-    </div>`;
-
-  const text = partes
-    .map(t => t.lines.map(l => l.replace(/<[^>]+>/g, '')).join('\n'))
-    .join('\n\n---\n\n') + '\n';
-
-  if (!process.env.RESEND_API_KEY) throw new Error('RESEND_API_KEY is not set');
-
-  const r = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from: MAIL_FROM_HOOPORIA,
-      to: [o.to],
-      /* El reply_to va al entrenador que mandó los avisos, no al
-         nuestro. Un padrino que le dé a Responder preguntando cómo
-         paga tiene que llegarle a quien cobra; si llega a Gostar
-         Digital, llega a alguien que no tiene su dinero ni cómo
-         ayudarle, y encima parece que lo cobramos nosotros.
-
-         Sin contacto cae en MAIL_REPLY_TO, y si eso también está
-         vacío no va reply_to ninguno — mejor eso que mandarle a un
-         buzón que nadie lee. */
-      ...(o.contactEmail ? { reply_to: o.contactEmail }
-                         : (MAIL_REPLY_TO ? { reply_to: MAIL_REPLY_TO } : {})),
-      subject: partes[0].subject,
-      html, text,
-    }),
-  });
-
-  if (!r.ok) {
-    const detail = await r.text().catch(() => '');
-    throw new Error(`Resend refused the notice (${r.status}): ${detail.slice(0, 200)}`);
-  }
-}
-
-app.post('/challenge-notices', async (req, res) => {
-  const { code, challenge_id } = req.body || {};
-  if (!code || !challenge_id) {
-    return res.status(400).json({ error: 'code and challenge_id are required' });
-  }
-
-  try {
-    // La puerta y la cuenta en la misma llamada. challenge_report
-    // comprueba el código con builder_check y que la campaña sea de
-    // ese entrenador; si cualquiera de las dos falla, contesta
-    // ok:false y aquí no se manda nada.
-    const { data: rep, error } = await supabase.rpc('challenge_report', {
-      p_code: String(code),
-      p_challenge: String(challenge_id),
-    });
-
-    if (error) {
-      console.error('challenge-notices report:', error.message);
-      return res.status(500).json({ error: 'report failed' });
-    }
-    if (!rep || rep.ok !== true) {
-      // El mismo mensaje que da el reporte, sin añadir nada: decir
-      // cuál de las dos cosas falló sería enumerar campañas ajenas.
-      return res.status(403).json({ error: (rep && rep.error) || 'not allowed' });
-    }
-
-    const teamName = rep.campaign || 'the program';
-    const retoName = (rep.challenge && rep.challenge.name) || teamName;
-
-    /* A quién le escribe un padrino que no sabe cómo pagar: el
-       entrenador dueño del código que acaba de mandar los avisos, que
-       el reporte saca de coaches. Puede venir vacío —con un
-       admin_code no hay fila— y entonces el correo vuelve a decir
-       sólo «el programa te dirá cómo». */
-    const contacto = rep.contact || {};
-    const out = { sent: 0, skipped: 0, zero: 0, failed: 0, errors: [] };
-
-    for (const p of rep.pledges || []) {
-      /* Quién sigue sin avisar. Es una lista blanca a propósito, y
-         costó una corrida de prueba averiguar por qué hacía falta:
-         cp_pledge crea las promesas con invoice_status 'pending', no
-         'open'. Pidiendo 'open' a secas, el botón contestaba
-         «1 saltada» y no mandaba nada — y el entrenador se habría ido
-         a buscar el fallo a Resend, que no tenía ninguno.
-
-         Lista blanca y no lista negra porque el error de cada lado no
-         es el mismo: si aparece un estado nuevo y no está aquí, el
-         padrino no recibe su aviso y el entrenador lo ve en la cuenta
-         de «saltadas»; al revés, un estado nuevo que debiera callar
-         acabaría en el buzón de una abuela por segunda vez, y eso no
-         se puede retirar. */
-      const SIN_AVISAR = [null, undefined, '', 'open', 'pending'];
-      if (SIN_AVISAR.indexOf(p.estado) === -1) { out.skipped++; continue; }
-
-      const total  = Number(p.total || 0);
-      const puntos = Number(p.puntos || 0);
-      const cents  = Math.round(total * 100);
-
-      /* Sin puntos no hay promesa que avisar, y por debajo de
-         cincuenta centavos no se le pide a nadie. Las dos filas se
-         cierran con su cifra guardada —no se dejan en 'open'
-         pareciendo pendientes para siempre— pero NO con 'void':
-         challenge_report esconde las anuladas, y esconder al nene que
-         no jugó es esconder el único problema que un reporte puede
-         enseñar. Con 'no_points' y 'too_small' siguen saliendo en el
-         reporte con su cero, que es la verdad. */
-      if (cents <= 0 || cents < 50) {
-        await supabase.from('pledges').update({
-          points_at_invoice: puntos,
-          team_amount: total,
-          amount: total,
-          platform_amount: 0,
-          invoice_status: cents <= 0 ? 'no_points' : 'too_small',
-        }).eq('id', p.id);
-        out.zero++;
-        continue;
-      }
-
-      /* La cuenta se guarda ANTES de mandar: si el correo falla, el
-         número ya está bueno y el aviso se puede repetir.
-
-         amount va igual que team_amount porque en este modelo no hay
-         recargo: el padrino paga la promesa y nada más. Dejar el
-         amount viejo ahí sería dejar escrito un número con el 10% de
-         un modelo que no existe. Y platform_amount a cero por lo
-         mismo: no hay cargo de plataforma que cobrarle a él. */
-      await supabase.from('pledges').update({
-        points_at_invoice: puntos,
-        team_amount: total,
-        amount: total,
-        platform_amount: 0,
-      }).eq('id', p.id);
-
-      try {
-        await sendChallengeNotice({
-          to: p.correo,
-          name: p.padrino,
-          who: p.jugador,
-          lang: p.idioma,
-          points: puntos,
-          teamName, retoName,
-          contactName: contacto.name || null,
-          contactEmail: contacto.email || null,
-          rate: Number(p.tarifa),
-          pledged: total,
-          // Para que el correo no cuente una multiplicación que no se
-          // hizo: el tope sólo se menciona si de verdad mordió.
-          cap:   p.tope != null && total < +(Number(p.tarifa) * puntos).toFixed(2)
-                   ? Number(p.tope) : null,
-          bruto: p.tope != null && total < +(Number(p.tarifa) * puntos).toFixed(2)
-                   ? +(Number(p.tarifa) * puntos).toFixed(2) : null,
-        });
-
-        // Sólo después de que el correo salió. 'sent' aquí quiere
-        // decir avisado, no facturado: no hay factura.
-        await supabase.from('pledges').update({
-          invoice_status: 'sent',
-          invoiced_at: new Date().toISOString(),
-        }).eq('id', p.id);
-        out.sent++;
-      } catch (e) {
-        // La fila se queda en 'open' con su cifra buena, así que se
-        // puede volver a pulsar el botón y sale sólo lo que faltó.
-        out.failed++;
-        out.errors.push(`${p.correo}: ${e.message}`);
-      }
-    }
-
-    console.log(`Challenge ${challenge_id} notices —`, JSON.stringify(out));
-    return res.json({ ok: true, campaign: teamName, challenge: retoName, ...out });
-  } catch (e) {
-    console.error('Challenge notices:', e.message);
-    return res.status(500).json({ error: e.message });
-  }
-});
-
 app.post('/game-invoices', async (req, res) => {
   const admin = await requireAdmin(req);
   if (!admin) return res.status(403).json({ error: 'Not authorized' });
@@ -2875,17 +2570,37 @@ const CHAT_APAGADO = String(process.env.COACH_CHAT_OFF || '') === '1';
 // Lo que el entrenador puede preguntar y el modelo sí puede contestar.
 // Es el mismo contenido de ayuda.html menos la sección El dinero, que
 // no pasa por aquí.
-const COACH_KB = `Eres la ayuda de Cada Punto para entrenadores. Cada Punto es
+//
+// SIN MARCA, A PROPÓSITO. Este endpoint lo comparten los dos
+// productos: el entrenador de baloncesto entra por Hooporia y el
+// programa de escuela por Cada Punto, con el mismo código y la misma
+// base. Antes esto decía "Cada Punto" seis veces, así que a un
+// entrenador de Hooporia la ayuda le contestaba con el nombre del
+// otro producto — y la ayuda es justo donde va el que ya está
+// confundido.
+//
+// La salida no es preguntarle a la base de qué producto es cada
+// código y tener dos textos que mantener. Es que el texto no nombre
+// ninguno: el que escribe está DENTRO de su propia página y ya sabe
+// dónde está. La ayuda habla de "nosotros" y de lo que hace la
+// plataforma, y eso es verdad en los dos sitios.
+const COACH_KB = `Eres la ayuda para entrenadores de esta plataforma. Esto es
 una recaudación por promesas: los padrinos de un nene prometen unos centavos por
 cada punto que anote ESE nene jugando The Fortress, dentro de un día de juego que
 pone el programa. Cuando cierra la ventana se cobra solo.
 
+NO NOMBRAS EL PRODUCTO. Ni el de baloncesto ni el de escuelas: el que te escribe
+está dentro de su propia página y ya sabe en cuál está, y si le dices el nombre
+del otro lo mandas a dudar de dónde metió a sus nenes. Habla de "esto", de "la
+plataforma" y de "nosotros". Si te preguntan cómo se llama, descríbelo por lo
+que hace y déjalo ahí.
+
 Contesta SOLO con lo que está aquí abajo. Hablas con un entrenador, no con un
 padrino.
 
-QUÉ ES CADA PUNTO Y CÓMO SE EMPIEZA
-- Cada Punto es una recaudación por promesas para equipos y programas
-  deportivos. Los padrinos de cada nene prometen unos centavos por cada punto
+QUÉ ES ESTO Y CÓMO SE EMPIEZA
+- Es una recaudación por promesas para equipos y programas. Los
+  padrinos de cada nene prometen unos centavos por cada punto
   que anote ese nene jugando The Fortress. Se juega el día de juego, el juego
   guarda los puntos solo, y de ahí sale lo que recaudó el programa.
 - El entrenador NO pone marcadores. No hay nada que escribir. Eso cambió.
@@ -2984,12 +2699,15 @@ EL MARCADOR SE PONE SOLO
   los padrinos.
 
 DE QUÉ MÁS PUEDES HABLAR
-- Hablas con gente de baloncesto, así que puedes hablar de baloncesto. Reglas,
-  posiciones, ejercicios, cómo montar una práctica, cómo llevar un grupo de
-  nenes, qué trabajar con un equipo que no tira bien — contesta normal, corto y
+- Hablas con quien lleva un grupo de nenes: unos son entrenadores de
+  baloncesto y otros llevan un programa de escuela. Sigue al que te escribe.
+  Si te habla de baloncesto, habla de baloncesto —reglas, posiciones,
+  ejercicios, cómo montar una práctica, qué trabajar con un equipo que no tira
+  bien—; si te habla de su salón o de su grupo, habla de eso. Corto, normal y
   con gusto, y vuelve a lo tuyo si viene a cuento.
-- Puedes hablar de baloncesto de Puerto Rico en general, de su historia y de lo
-  que significa allí, con cariño y sin inventar.
+- Si es gente de baloncesto, puedes hablar del baloncesto de Puerto Rico en
+  general, de su historia y de lo que significa allí, con cariño y sin
+  inventar.
 - PERO hay una raya que no se cruza: NADA de lo que pase ahora mismo o de lo que
   haya que comprobar. No sabes quién ganó anoche, ni cómo va la tabla, ni quién
   juega en qué equipo esta temporada, ni qué pasó en un partido, ni lo que haya
@@ -3002,7 +2720,7 @@ DE QUÉ MÁS PUEDES HABLAR
   aquí. Si no lo sabes, dilo. Decir "no sé" es la respuesta correcta y no es un
   fallo.
 - Nada de política, religión, salud, dinero de nadie, ni consejo legal. Si sale,
-  dilo con buen modo y vuelve al baloncesto.
+  dilo con buen modo y vuelve a lo tuyo.
 
 CÓMO CONTESTAS
 - Por defecto, en el idioma que te diga el sistema abajo del todo, aunque la
@@ -3021,20 +2739,19 @@ CÓMO CONTESTAS
 - No prometas lo que vamos a hacer nosotros.
 - Nunca des códigos, nombres de nenes, ni nada de otro equipo. Si te lo piden,
   dile que eso no lo puedes dar.
-- Si te preguntan algo de Cada Punto que no esté contestado aquí arriba — de la
-  plataforma, de una campaña, de un cobro, de algo que haya que mirar por dentro
-  — dilo y manda a escribir a gostardigital@gmail.com. Decir "eso no lo sé,
-  escríbenos" es la respuesta correcta y no es un fallo.
-- Pero no mandes al correo una pregunta de baloncesto que puedas contestar tú.
-  Un entrenador que pregunta cómo trabajar los tiros libres quiere una respuesta,
-  no una dirección.
+- Si te preguntan algo que no esté contestado aquí arriba — de la plataforma,
+  de una campaña, de un cobro, de algo que haya que mirar por dentro — dilo y
+  manda a escribir a gostardigital@gmail.com. Decir "eso no lo sé, escríbenos"
+  es la respuesta correcta y no es un fallo.
+- Pero no mandes al correo lo que puedas contestar tú. Un entrenador que
+  pregunta cómo trabajar los tiros libres quiere una respuesta, no una
+  dirección.
 - Eres una ayuda, no una persona. No tienes nombre y no dices que eres John ni
   nadie de Gostar Digital.
-- Pero hablas DE PARTE de Cada Punto, no de fuera. Cuando digas lo que
+- Pero hablas DE PARTE de la plataforma, no de fuera. Cuando digas lo que
   hacemos, di "nosotros": nosotros armamos la campaña, nosotros damos los
-  códigos, escríbenos. Nunca "ellos", ni "la empresa", ni "el equipo de
-  Cada Punto" — estás en su propia página y eso suena a que esto es de
-  otra gente.`;
+  códigos, escríbenos. Nunca "ellos", ni "la empresa", ni "el equipo" —
+  estás en su propia página y eso suena a que esto es de otra gente.`;
 
 // ── Lo de dinero, palabra por palabra ─────────────────────────────
 // El mismo texto que ayuda.html y que cuadra con terms.html y
@@ -3250,199 +2967,6 @@ app.post('/coach/chat', async (req, res) => {
   } catch (e) {
     console.error('coach/chat error:', e);
     res.status(500).json({ error: String(e) });
-  }
-});
-
-// ══════════════════════════════════════════════════════
-//  LA LICENCIA DE UN EVENTO — el único cobro que existe
-//
-//  Hooporia no cobra promesas y no le escribe a ningún padrino. El
-//  único dinero es la licencia de la plataforma, y la paga el
-//  programa: $49 por equipo y evento, $29 si la plantilla tiene
-//  menos de ocho, y nada si el evento no recogió ni una promesa.
-//
-//  El importe NO se calcula aquí. Sale de licencia_calculo() en la
-//  base, que es donde vive la tarifa, y este endpoint lo pide dos
-//  veces —una para enseñarlo y otra para cobrarlo— para que lo que
-//  se confirma y lo que se cobra sean el mismo número.
-//
-//  ── Dos pasos, porque la llave es de producción ──────────────────
-//  Sin confirmar:true esto NO toca Stripe. Devuelve lo que se
-//  cobraría y a quién, para que el admin lo lea antes de que salga
-//  nada. Con confirmar:true factura de verdad y Stripe le manda el
-//  correo al programa. Un endpoint de un solo paso, con una llave
-//  live, es una factura real a un cliente real a un clic de
-//  distancia mientras se prueba.
-//
-//  ── El orden, que importa ────────────────────────────────────────
-//  Primero se escribe la fila, después se factura en Stripe. Así el
-//  índice único de licencias es lo que impide la factura doble —no
-//  un if de aquí—, y dos clics seguidos dan llave duplicada en vez
-//  de dos facturas. Si Stripe falla, la fila se borra: no llegó a
-//  tener factura, así que no deja un evento marcado como cobrado
-//  cuando no se cobró, y se puede reintentar.
-// ══════════════════════════════════════════════════════
-
-// Siete días, como dice la página. Si esto y la página dejan de
-// decir lo mismo, la página es la que firmó el programa.
-const LICENCIA_DIAS = 7;
-
-function modoDeStripe() {
-  const k = process.env.STRIPE_SECRET_KEY || '';
-  return k.startsWith('sk_live') ? 'live' : (k.startsWith('sk_test') ? 'test' : 'sin llave');
-}
-
-app.post('/licencia', async (req, res) => {
-  const admin = await requireAdmin(req);
-  if (!admin) return res.status(403).json({ error: 'Not authorized' });
-
-  const { challenge_id, confirmar } = req.body || {};
-  if (!challenge_id) return res.status(400).json({ error: 'challenge_id is required' });
-
-  try {
-    const { data: calc, error: errCalc } =
-      await supabase.rpc('licencia_calculo', { p_challenge: challenge_id });
-    if (errCalc) throw errCalc;
-    if (!calc || !calc.ok) {
-      return res.status(404).json({ error: 'no_calc', why: (calc && calc.why) || 'sin cálculo' });
-    }
-
-    const vista = {
-      modo: modoDeStripe(),
-      challenge: calc.challenge,
-      programa: calc.programa,
-      roster: calc.roster,
-      promesas: calc.promesas,
-      cobrable: calc.cobrable,
-      amount_cents: calc.amount_cents,
-      program_name: calc.program_name,
-      program_email: calc.program_email,
-      ya_facturada: calc.ya_facturada,
-      licencia: calc.licencia,
-      dias: LICENCIA_DIAS
-    };
-
-    // ── Lo que impide facturar, dicho antes de confirmar ──────────
-    if (calc.ya_facturada) {
-      return res.status(409).json({ error: 'ya_facturada', ...vista });
-    }
-    // Sin promesas, sin cargo. Es lo que dice la página y lo que
-    // firma el programa, así que no puede depender de que nadie se
-    // acuerde: aquí se niega.
-    if (!calc.cobrable) {
-      return res.status(422).json({ error: 'sin_promesas', ...vista });
-    }
-    if (!calc.program_email) {
-      return res.status(422).json({ error: 'sin_correo', ...vista });
-    }
-
-    // ── Vista previa ──────────────────────────────────────────────
-    if (confirmar !== true) {
-      return res.json({ vista_previa: true, ...vista });
-    }
-
-    // ── La fila primero ───────────────────────────────────────────
-    const { data: fila, error: errFila } = await supabase
-      .from('licencias')
-      .insert({
-        challenge_id,
-        campaign_id: calc.campaign_id,
-        amount_cents: calc.amount_cents,
-        roster: calc.roster,
-        promesas: calc.promesas,
-        program_email: calc.program_email,
-        program_name: calc.program_name,
-        estado: 'open'
-      })
-      .select()
-      .single();
-
-    if (errFila) {
-      // 23505 = llave duplicada: alguien ya la facturó entre la vista
-      // previa y el clic. Es exactamente lo que el índice existe para
-      // hacer, así que no es un fallo del servidor.
-      if (errFila.code === '23505') {
-        return res.status(409).json({ error: 'ya_facturada', ...vista });
-      }
-      throw errFila;
-    }
-
-    // ── Y ahora Stripe ────────────────────────────────────────────
-    try {
-      let cliente;
-      const hay = await stripe.customers.list({ email: calc.program_email, limit: 1 });
-      cliente = (hay.data && hay.data[0])
-        || await stripe.customers.create({
-             email: calc.program_email,
-             name: calc.program_name || calc.programa || undefined,
-             metadata: { campaign_id: String(calc.campaign_id || '') }
-           });
-
-      const concepto = `Hooporia — licencia del evento: ${calc.challenge}`;
-
-      /* La factura antes que la línea, y la línea atada a ella por
-         su id. Al revés —líneas sueltas y luego la factura— Stripe
-         barre TODAS las líneas pendientes de ese cliente, así que
-         una línea que se quedó de un intento fallido acabaría
-         cobrada dentro de la factura siguiente. */
-      const factura = await stripe.invoices.create({
-        customer: cliente.id,
-        collection_method: 'send_invoice',
-        days_until_due: LICENCIA_DIAS,
-        description: concepto,
-        auto_advance: false,
-        metadata: {
-          producto: 'hooporia',
-          challenge_id: String(challenge_id),
-          licencia_id: String(fila.id)
-        }
-      });
-
-      await stripe.invoiceItems.create({
-        customer: cliente.id,
-        invoice: factura.id,
-        amount: calc.amount_cents,
-        currency: 'usd',
-        description: `${concepto} · plantilla de ${calc.roster}`
-      });
-
-      const firmada = await stripe.invoices.finalizeInvoice(factura.id);
-      const enviada = await stripe.invoices.sendInvoice(firmada.id);
-
-      const { data: puesta } = await supabase
-        .from('licencias')
-        .update({
-          estado: 'enviada',
-          stripe_invoice_id: enviada.id,
-          stripe_hosted_url: enviada.hosted_invoice_url || null,
-          issued_at: new Date().toISOString(),
-          due_at: enviada.due_date ? new Date(enviada.due_date * 1000).toISOString() : null
-        })
-        .eq('id', fila.id)
-        .select()
-        .single();
-
-      console.log(`Licencia ${fila.id} facturada: ${enviada.id} (${modoDeStripe()})`);
-      return res.json({
-        ok: true, ...vista,
-        estado: 'enviada',
-        stripe_invoice_id: enviada.id,
-        url: enviada.hosted_invoice_url || null,
-        due_at: puesta ? puesta.due_at : null
-      });
-
-    } catch (eStripe) {
-      /* No llegó a haber factura, así que la fila sobra — y dejarla
-         marcaría el evento como cobrado sin haberlo cobrado, y el
-         índice único impediría reintentarlo. */
-      await supabase.from('licencias').delete().eq('id', fila.id);
-      console.error('Licencia — Stripe falló, fila retirada:', eStripe);
-      return res.status(502).json({ error: 'stripe', why: String(eStripe && eStripe.message || eStripe), ...vista });
-    }
-
-  } catch (e) {
-    console.error('/licencia:', e);
-    return res.status(500).json({ error: String(e && e.message || e) });
   }
 });
 
